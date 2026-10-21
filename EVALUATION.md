@@ -13,11 +13,11 @@ to a pass; anything else would be **FAIL** and fixed before release.
 
 | # | Criterion | Status | Evidence |
 | --- | --- | --- | --- |
-| 1 | Public repository readiness | **PENDING-PUBLISH** | All content is complete and committed locally, but the repository has not yet been pushed to `github.com/DangTruong96/shorts-qc`. Publication is a deliberate separate step after this audit. The first CI run also happens on that first push. Nothing else in this table depends on inventing publish state. |
+| 1 | Public repository readiness | **PASS** | Published 2026-10-21: https://github.com/DangTruong96/shorts-qc (created 19:50 UTC), release `v0.1.0` (20:05 UTC), topics set (`ai-video`, `cli`, `ffmpeg`, `python`, `quality-gate`, `video-qc`, `youtube-shorts`). First CI run green on the publish push (see row 5). |
 | 2 | OSI-approved license | PASS | `LICENSE` holds the full MIT text (an OSI-approved license); `pyproject.toml` carries the `License :: OSI Approved :: MIT License` classifier and `license = { text = "MIT" }`. |
 | 3 | README: install, usage, examples | PASS | `README.md` — Requirements, Install, Usage with sample reports for both commands, flag summary, and a "What it does not do" section; worked examples in `examples/`. |
 | 4 | Automated tests passing | PASS | `python3 -m unittest discover -s tests -v` → **14 tests, OK** (caption capacity, PPM white-edge ratios, silencedetect parsing), re-run on the release commit. |
-| 5 | CI configured | PASS | `.github/workflows/ci.yml` — GitHub Actions, `ubuntu-latest`, matrix Python 3.9 / 3.10 / 3.11 / 3.12, runs the unittest suite on `push` and `pull_request`. (First execution is part of row 1's publish step.) |
+| 5 | CI configured | PASS | `.github/workflows/ci.yml` — GitHub Actions, `ubuntu-latest`, matrix Python 3.9 / 3.10 / 3.11 / 3.12, runs the unittest suite on `push` and `pull_request`. First execution on the publish push (2026-10-21): **green** — 3 consecutive success runs, latest 20:05:50 UTC. |
 | 6 | Changelog + semantic versioning | PASS | `CHANGELOG.md` documents `[0.1.0] - 2026-10-22` in Keep-a-Changelog format; version `0.1.0` in `pyproject.toml`; annotated release state is the git tag `v0.1.0`; README's governance section states the semver policy. |
 | 7 | Contributing guide | PASS | `CONTRIBUTING.md` — ground rules (stdlib-only runtime, real-failure rule for gates, threshold policy), development commands, bug-report contents. |
 | 8 | Code of Conduct | PASS | `CODE_OF_CONDUCT.md` — Contributor Covenant v2.1 standard text, with the enforcement contact filled in (the maintainer, via GitHub). |
@@ -32,18 +32,18 @@ to a pass; anything else would be **FAIL** and fixed before release.
 
 | Status | Count |
 | --- | --- |
-| PASS | 13 |
+| PASS | 14 |
 | FAIL | 0 |
-| PENDING-PUBLISH | 1 |
+| PENDING-PUBLISH | 0 |
 
 ## What PENDING-PUBLISH means, plainly
 
-Row 1 is the only open item, and it is open on purpose: this audit was
-run on the local release candidate. Publishing (creating the GitHub
-repository, pushing `master` and the `v0.1.0` tag, confirming the
-first CI run is green) completes it. Until that push happens, any
-claim that this project is "public" would be false, so this document
-does not make it.
+Row 1 was the only open item at audit time, and it was open on purpose:
+this audit was first run on the local release candidate. Publishing
+(creating the GitHub repository, pushing and tagging `v0.1.0`, confirming
+the first CI run is green) completed it on 2026-10-21 — see the updated
+rows 1 and 5 above. Until that push happened, any claim that this project
+is "public" would have been false; this document no longer makes it.
 
 ## Known limitations a reviewer should also see
 
