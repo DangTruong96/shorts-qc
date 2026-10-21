@@ -1,0 +1,135 @@
+"""Unit tests for shorts_qc (stdlib unittest only).
+
+Run from the project root:
+    python3 -m unittest discover -s tests -v
+"""
+
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import shorts_qc as sq
+
+
+def make_ppm(width: int, height: int, pixel_fn) -> bytes:
+    """Build P6 PPM bytes; pixel_fn(x, y) -> (r, g, b)."""
+    raster = bytearray()
+    for y in range(height):
+        for x in range(width):
+            raster.extend(pixel_fn(x, y))
+    return b"P6\n%d %d\n255\n" % (width, height) + bytes(raster)
+
+
+class CaptionCapacityTests(unittest.TestCase):
+    def test_production_rule_720_60_gives_11(self):
+        # The rule this project exists to encode: fontsize 60 burnt-in
+        # captions on a 720 px-wide vertical video fit at most 11
+        # full-width characters per line.
+        self.assertEqual(sq.caption_capacity(720, 60), 11)
+
+    def test_capacity_scales(self):
+        self.assertEqual(sq.caption_capacity(1280, 60), 20)   # (1280-60)//60
+        self.assertEqual(sq.caption_capacity(720, 48), 14)    # (720-48)//48
+        self.assertEqual(sq.caption_capacity(1080, 90), 11)   # (1080-90)//90
+
+    def test_eleven_fullwidth_chars_pass_twelve_fail(self):
+        line_ok = "あ" * 11
+        line_long = "あ" * 12
+        verdicts = sq.caption_line_verdicts([line_ok, line_long], 720, 60)
+        self.assertEqual(verdicts[0]["status"], "pass")
+        self.assertEqual(verdicts[0]["width_units"], 11.0)
+        self.assertEqual(verdicts[1]["status"], "fail")
+        self.assertEqual(verdicts[1]["width_units"], 12.0)
+
+    def test_mixed_width_characters(self):
+        # Half-width / Latin characters count 0.55 of a full-width unit.
+        self.assertAlmostEqual(sq.line_display_width("ab"), 1.1)
+        self.assertAlmostEqual(sq.line_display_width("あa"), 1.55)
+        verdicts = sq.caption_line_verdicts(["hello"], 720, 60)
+        self.assertEqual(verdicts[0]["status"], "pass")
+
+    def test_invalid_fontsize(self):
+        with self.assertRaises(ValueError):
+            sq.caption_capacity(720, 0)
+
+
+class WhiteEdgeTests(unittest.TestCase):
+    def test_all_black_has_no_white_edges(self):
+        data = make_ppm(100, 100, lambda x, y: (0, 0, 0))
+        w, h, rgb = sq.parse_ppm_bytes(data)
+        self.assertEqual((w, h), (100, 100))
+        ratios = sq.white_edge_ratios(w, h, rgb)
+        for edge in ("left", "right", "top", "bottom"):
+            self.assertEqual(ratios[edge], 0.0)
+
+    def test_white_right_edge_detected(self):
+        # Right 15% band fully white (the classic AI-panel fade failure).
+        width = 100
+        data = make_ppm(width, 100,
+                        lambda x, y: (255, 255, 255) if x >= width - 15 else (0, 0, 0))
+        w, h, rgb = sq.parse_ppm_bytes(data)
+        ratios = sq.white_edge_ratios(w, h, rgb)
+        self.assertEqual(ratios["right"], 1.0)
+        self.assertEqual(ratios["left"], 0.0)
+
+    def test_partial_white_band_ratio(self):
+        # Half of the top band white -> ratio ~0.5, above the 3% threshold.
+        data = make_ppm(100, 100,
+                        lambda x, y: (255, 255, 255) if (y < 15 and x < 50) else (10, 10, 10))
+        w, h, rgb = sq.parse_ppm_bytes(data)
+        ratios = sq.white_edge_ratios(w, h, rgb)
+        self.assertAlmostEqual(ratios["top"], 0.5, places=2)
+        self.assertGreater(ratios["top"], sq.EDGE_WHITE_THRESHOLD)
+
+    def test_near_white_threshold(self):
+        # 249 is *not* near-white; 250 is. Uniform 249 frame -> 0.0.
+        data = make_ppm(20, 20, lambda x, y: (249, 249, 249))
+        w, h, rgb = sq.parse_ppm_bytes(data)
+        self.assertEqual(sq.white_edge_ratios(w, h, rgb)["left"], 0.0)
+        data = make_ppm(20, 20, lambda x, y: (250, 250, 250))
+        w, h, rgb = sq.parse_ppm_bytes(data)
+        self.assertEqual(sq.white_edge_ratios(w, h, rgb)["left"], 1.0)
+
+    def test_parse_ppm_rejects_non_p6(self):
+        with self.assertRaises(ValueError):
+            sq.parse_ppm_bytes(b"P3\n1 1\n255\n0 0 0\n")
+
+
+SAMPLE_SILENCE_STDERR = """\
+[ffmpeg version banner omitted]
+[silencedetect @ 0x55] silence_start: 0.512
+[silencedetect @ 0x55] silence_end: 1.104 | silence_duration: 0.592
+[silencedetect @ 0x55] silence_start: 4.000
+[silencedetect @ 0x55] silence_end: 7.500 | silence_duration: 3.5
+"""
+
+
+class SilenceParsingTests(unittest.TestCase):
+    def test_parse_gaps(self):
+        gaps = sq.parse_silence_gaps(SAMPLE_SILENCE_STDERR)
+        self.assertEqual(len(gaps), 2)
+        self.assertAlmostEqual(gaps[0]["start"], 0.512)
+        self.assertAlmostEqual(gaps[0]["end"], 1.104)
+        self.assertAlmostEqual(gaps[0]["duration"], 0.592)
+        self.assertAlmostEqual(gaps[1]["start"], 4.0)
+        self.assertAlmostEqual(gaps[1]["duration"], 3.5)
+
+    def test_unclosed_trailing_silence_uses_duration(self):
+        text = SAMPLE_SILENCE_STDERR + "[silencedetect @ 0x55] silence_start: 9.0\n"
+        gaps = sq.parse_silence_gaps(text, duration=10.0)
+        self.assertEqual(len(gaps), 3)
+        self.assertAlmostEqual(gaps[-1]["end"], 10.0)
+        self.assertAlmostEqual(gaps[-1]["duration"], 1.0)
+
+    def test_unclosed_trailing_silence_without_duration_ignored(self):
+        text = "[silencedetect @ 0x55] silence_start: 9.0\n"
+        self.assertEqual(sq.parse_silence_gaps(text), [])
+
+    def test_no_silence(self):
+        self.assertEqual(sq.parse_silence_gaps("no silence in here\n"), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
