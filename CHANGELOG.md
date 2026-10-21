@@ -28,3 +28,15 @@ AI-video production pipeline.
   (720 px / fontsize 60 → max 11 full-width characters per line).
 - Unit tests for caption capacity math, white-edge ratios on synthetic
   PPM data, and silencedetect output parsing.
+- GitHub Actions CI (`.github/workflows/ci.yml`) running the unit
+  tests on Python 3.9, 3.10, 3.11, and 3.12.
+- Community and governance files: CODE_OF_CONDUCT.md (Contributor
+  Covenant 2.1), SECURITY.md, issue templates (bug report, feature
+  request), a pull-request template, and a "Maintainer & governance"
+  section in the README.
+- `docs/USAGE.md` — per-gate guide with the production failure behind
+  each gate, the full flag reference, and an annotated JSON report.
+- `examples/` — sample caption file and captured real output from
+  running the tool on synthetic demo videos.
+- `EVALUATION.md` — self-audit of the repository against common
+  open-source project criteria.

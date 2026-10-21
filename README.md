@@ -110,8 +110,8 @@ white right edge:
 ShortsQC report — gapped.mp4
 [PASS] probe: 360x640 (portrait), 30.0 fps, 9.0s — aspect matches 9:16
 [PASS] loudness: -21.9 LUFS (allowed -24.0 .. -10.0)
-[FAIL] dead-air: silence gap of 2.995s at 3.018594s exceeds --max-gap 2.5s (1 offending gap(s))
-[FAIL] white-edge: near-white edge band(s) over the 3% threshold: right 98.1%, top 15.8%, bottom 15.8% (art may be fading to white)
+[FAIL] dead-air: silence gap of 3.0s at 2.999977s exceeds --max-gap 2.5s (1 offending gap(s))
+[FAIL] white-edge: near-white edge band(s) over the 3% threshold: right 99.5%, top 14.9%, bottom 15.0% (art may be fading to white)
 [SKIP] language: skipped: pip install faster-whisper (language gate not available)
 OVERALL: FAIL
 ```
@@ -159,13 +159,58 @@ shorts-qc caption --width 720 --fontsize 60 --file narration-lines.txt
   the pipeline this came from, that panel turned out to be broken far
   more often than it was intentional.
 
+## Documentation
+
+- [docs/USAGE.md](docs/USAGE.md) — the deep guide: every gate, the
+  production failure it catches, the full flag reference, and an
+  annotated JSON report.
+- [examples/](examples/) — sample caption file plus real, captured
+  output from running the tool on synthetic demo videos.
+
 ## Roadmap
 
 - **v0.2** — per-scene reports (split by silence/scene boundaries and
   report loudness + gaps per scene instead of per file).
 - **v0.2** — SRT input for the caption gate: check every subtitle cue
   against the frame size and the cue's own duration.
-- Maybe: black-frame / frozen-frame detection.
+- **v0.3** — black-frame / frozen-frame detection (a scene whose
+  picture never changes, or drops to black, is the visual counterpart
+  of dead air).
+- **v0.3** — a project config file (`shortsqc.toml`) so a pipeline can
+  pin its own thresholds (frame size, fontsize, loudness window,
+  max gap) instead of repeating flags on every call.
+- Maybe: a reusable GitHub Action wrapping the `check` command.
+
+Nothing on this list is promised on a date; items move when a real
+pipeline failure promotes them.
+
+## Maintainer & governance
+
+ShortsQC is maintained by **DangTruong96**, currently the sole
+maintainer. That means, concretely:
+
+- **Decisions.** The maintainer makes final calls on new gates,
+  threshold changes, and releases. The standing rules are not up for
+  silent revision: runtime stays standard-library only, and a gate
+  exists only if it catches a real production failure (see
+  [CONTRIBUTING.md](CONTRIBUTING.md)).
+- **Issues & PRs.** Bug reports and feature requests are triaged by
+  the maintainer; feature requests need the production failure behind
+  them described, or they will be closed with an explanation.
+- **Releases.** Semantic versioning (`MAJOR.MINOR.PATCH`): breaking
+  changes to flags, output format, or exit codes bump MAJOR; new gates
+  or flags bump MINOR; fixes bump PATCH. Every release is a git tag
+  (`vX.Y.Z`) with a matching [CHANGELOG.md](CHANGELOG.md) entry.
+- **Conduct & security.** Participation is covered by the
+  [Code of Conduct](CODE_OF_CONDUCT.md); vulnerabilities are reported
+  privately as described in [SECURITY.md](SECURITY.md).
+- **Self-audit.** [EVALUATION.md](EVALUATION.md) records an honest
+  checklist of this repository against common open-source project
+  criteria, including the items that are not done yet.
+
+If the project ever gains regular co-maintainers, this section will be
+updated to name them and to describe how decisions move from one
+person's call to a shared process.
 
 ## Contributing
 
