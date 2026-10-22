@@ -3,6 +3,27 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.0] - 2026-10-23
+
+### Added
+
+- **freeze-black gate** in `check`: the visual counterpart of
+  dead-air. Samples frames at 2 fps (scaled to 96 px wide) in a single
+  ffmpeg pass and measures them in pure Python (mean Rec. 601 luma;
+  mean absolute pixel difference between consecutive samples). Fails
+  on continuous black picture longer than `--max-black` (default
+  1.5 s) or a frozen, unchanging picture longer than `--max-freeze`
+  (default 3.0 s), reporting each defect's duration and start time.
+  Catches encoder/compositor hangs that repeat one frame and panel
+  renders that drop the picture to black mid-video.
+- 9 unit tests for the frame-series analysis (luma, frame diffs,
+  black/frozen run measurement, thresholds, mismatched frame sizes)
+  — 23 tests total.
+- `examples/` gains a third synthetic demo video, `stuck.mp4`
+  (2.5 s of black followed by 4 s of a static frame), with captured
+  real output; README and `docs/USAGE.md` document the new gate,
+  its flags, and its JSON details.
+
 ## [0.1.0] - 2026-10-22
 
 First public release. Extracted from the quality gates of a daily
