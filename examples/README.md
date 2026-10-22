@@ -1,17 +1,20 @@
 # Examples
 
 Everything below is **real output captured from running ShortsQC
-v0.1.0** (Python 3.12, ffmpeg from the system package) — nothing here
+v0.2.0** (Python 3.12, ffmpeg from the system package) — nothing here
 is written by hand. Exact numbers (LUFS, timestamps, ratios) may vary
 slightly with a different ffmpeg version, but the verdicts reproduce.
 
 ## The demo videos
 
-The two videos are synthetic files generated with ffmpeg's built-in
+The three videos are synthetic files generated with ffmpeg's built-in
 test sources — a moving test pattern plus a sine tone. `gapped.mp4` is
 the same file with two defects built in on purpose: **3 seconds of
 silence** in the middle of the audio and a **solid white column**
-drawn over the right 54 px of the picture.
+drawn over the right 54 px of the picture. `stuck.mp4` builds in the
+visual counterpart: **2.5 seconds of black picture** (2.5 s–5 s)
+followed by **4 seconds of one static red frame** (5 s–9 s), with the
+tone running throughout.
 
 ```bash
 # clean.mp4 — 9 s, 360x640 (9:16), test pattern + 440 Hz tone
@@ -27,6 +30,15 @@ ffmpeg -y -f lavfi -i testsrc2=duration=9:size=360x640:rate=30 \
   -filter_complex "[0:v]drawbox=x=iw-54:y=0:w=54:h=ih:color=white:t=fill[v];[2:a]atrim=0:3[a2];[1:a][a2][3:a]concat=n=3:v=0:a=1[a]" \
   -map "[v]" -map "[a]" -t 9 \
   -c:v libx264 -pix_fmt yuv420p -c:a aac gapped.mp4
+
+# stuck.mp4 — 2.5 s moving, then 2.5 s black, then 4 s of a static red frame
+ffmpeg -y -f lavfi -i testsrc2=duration=2.5:size=360x640:rate=30 \
+  -f lavfi -i color=c=black:duration=2.5:size=360x640:rate=30 \
+  -f lavfi -i color=c=red:duration=4:size=360x640:rate=30 \
+  -f lavfi -i sine=frequency=440:duration=9 \
+  -filter_complex "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]" \
+  -map "[v]" -map 3:a -shortest \
+  -c:v libx264 -pix_fmt yuv420p -c:a aac stuck.mp4
 ```
 
 ## `check` on the clean video
@@ -41,6 +53,7 @@ ShortsQC report — clean.mp4
 [PASS] loudness: -21.8 LUFS (allowed -24.0 .. -10.0)
 [PASS] dead-air: no silence gap longer than 2.5s inside the file (0 gap(s) detected, all within tolerance or at the edges)
 [PASS] white-edge: all edge bands <= 3% near-white across 5 frame(s)
+[PASS] freeze-black: no black run over 1.5s and no frozen run over 3.0s across 18 sampled frame(s) (longest black 0.0s, longest freeze 0.0s)
 [SKIP] language: skipped: pip install faster-whisper (language gate not available)
 OVERALL: PASS
 ```
@@ -61,6 +74,7 @@ ShortsQC report — gapped.mp4
 [PASS] loudness: -21.9 LUFS (allowed -24.0 .. -10.0)
 [FAIL] dead-air: silence gap of 3.0s at 2.999977s exceeds --max-gap 2.5s (1 offending gap(s))
 [FAIL] white-edge: near-white edge band(s) over the 3% threshold: right 99.5%, top 14.9%, bottom 15.0% (art may be fading to white)
+[PASS] freeze-black: no black run over 1.5s and no frozen run over 3.0s across 18 sampled frame(s) (longest black 0.0s, longest freeze 0.0s)
 [SKIP] language: skipped: pip install faster-whisper (language gate not available)
 OVERALL: FAIL
 ```
@@ -72,6 +86,29 @@ width); the bands are measured independently, corners included.
 
 The same run with `--json` produces the machine-readable report shown
 and annotated in [docs/USAGE.md](../docs/USAGE.md#annotated-json-report).
+
+## `check` on the stuck video (v0.2.0)
+
+```bash
+python3 shorts_qc.py check stuck.mp4 --expect 9:16 --lang ja
+```
+
+```text
+ShortsQC report — stuck.mp4
+[PASS] probe: 360x640 (portrait), 30.0 fps, 9.0s — aspect matches 9:16
+[PASS] loudness: -21.8 LUFS (allowed -24.0 .. -10.0)
+[PASS] dead-air: no silence gap longer than 2.5s inside the file (0 gap(s) detected, all within tolerance or at the edges)
+[PASS] white-edge: all edge bands <= 3% near-white across 5 frame(s)
+[FAIL] freeze-black: black picture for 2.5s at 2.5s (limit 1.5s); frozen picture for 3.5s at 5.0s (limit 3.0s)
+[SKIP] language: skipped: pip install faster-whisper (language gate not available)
+OVERALL: FAIL
+```
+
+Exit code: `1`. The audio and the frame edges are fine in this file —
+only the picture misbehaves, and only the freeze-black gate sees it:
+2.5 s of black starting exactly where the black segment was built in,
+then a picture that provably does not change for 3.5 s (the 4 s
+static segment, measured between the 2 fps samples).
 
 ## `caption` on the sample lines
 

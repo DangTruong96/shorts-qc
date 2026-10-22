@@ -51,6 +51,7 @@ runs the same way every time. That is all this tool is.
 | **loudness** | Integrated loudness via ffmpeg `loudnorm` analysis. Fails below **−24 LUFS** or above **−10 LUFS** (both configurable). Falls back to `volumedetect` (reported as a fallback, not LUFS) if loudnorm output cannot be parsed. |
 | **dead-air** | ffmpeg `silencedetect` (noise=−40 dB, min duration 1.2 s). Fails if any silence gap *inside* the file exceeds `--max-gap` (default 2.5 s). Gaps touching only the first/last 0.3 s are ignored. |
 | **white-edge** | Samples up to 5 frames evenly across the video, parses them as PPM in pure Python, and measures near-white pixels (all channels ≥ 250) in the outer 15% band of each edge. An edge band above **3%** near-white fails. |
+| **freeze-black** | Samples frames at 2 fps (scaled to 96 px wide) in one ffmpeg pass and measures them in pure Python: fails on continuous black picture over **1.5 s** (`--max-black`) or a frozen, unchanging picture over **3.0 s** (`--max-freeze`). The visual counterpart of dead air. |
 | **language** *(optional)* | With `faster-whisper` installed and `--lang ja`, extracts the audio, transcribes with automatic language detection, and fails if any segment contains a run of ≥ 4 Latin-alphabet characters. Without the package it prints a clear `skipped` notice — it never crashes. |
 
 `shorts-qc caption` is the caption-fit gate on its own:
@@ -99,6 +100,7 @@ ShortsQC report — clean.mp4
 [PASS] loudness: -21.8 LUFS (allowed -24.0 .. -10.0)
 [PASS] dead-air: no silence gap longer than 2.5s inside the file (0 gap(s) detected, all within tolerance or at the edges)
 [PASS] white-edge: all edge bands <= 3% near-white across 5 frame(s)
+[PASS] freeze-black: no black run over 1.5s and no frozen run over 3.0s across 18 sampled frame(s) (longest black 0.0s, longest freeze 0.0s)
 [SKIP] language: skipped: pip install faster-whisper (language gate not available)
 OVERALL: PASS
 ```
@@ -112,6 +114,7 @@ ShortsQC report — gapped.mp4
 [PASS] loudness: -21.9 LUFS (allowed -24.0 .. -10.0)
 [FAIL] dead-air: silence gap of 3.0s at 2.999977s exceeds --max-gap 2.5s (1 offending gap(s))
 [FAIL] white-edge: near-white edge band(s) over the 3% threshold: right 99.5%, top 14.9%, bottom 15.0% (art may be fading to white)
+[PASS] freeze-black: no black run over 1.5s and no frozen run over 3.0s across 18 sampled frame(s) (longest black 0.0s, longest freeze 0.0s)
 [SKIP] language: skipped: pip install faster-whisper (language gate not available)
 OVERALL: FAIL
 ```
@@ -128,6 +131,8 @@ shorts-qc check final.mp4 \
   --min-lufs -24 \       # loudness floor
   --max-lufs -10 \       # loudness ceiling
   --max-gap 2.5 \        # max tolerated inside silence, seconds
+  --max-black 1.5 \      # max tolerated continuous black picture, seconds
+  --max-freeze 3.0 \     # max tolerated frozen picture, seconds
   --lang ja \            # enable the language gate (needs faster-whisper)
   --json                 # machine-readable report
 ```
@@ -169,17 +174,17 @@ shorts-qc caption --width 720 --fontsize 60 --file narration-lines.txt
 
 ## Roadmap
 
-- **v0.2** — per-scene reports (split by silence/scene boundaries and
+- **Next** — per-scene reports (split by silence/scene boundaries and
   report loudness + gaps per scene instead of per file).
-- **v0.2** — SRT input for the caption gate: check every subtitle cue
+- **Next** — SRT input for the caption gate: check every subtitle cue
   against the frame size and the cue's own duration.
-- **v0.3** — black-frame / frozen-frame detection (a scene whose
-  picture never changes, or drops to black, is the visual counterpart
-  of dead air).
-- **v0.3** — a project config file (`shortsqc.toml`) so a pipeline can
-  pin its own thresholds (frame size, fontsize, loudness window,
+- **Later** — a project config file (`shortsqc.toml`) so a pipeline
+  can pin its own thresholds (frame size, fontsize, loudness window,
   max gap) instead of repeating flags on every call.
 - Maybe: a reusable GitHub Action wrapping the `check` command.
+
+(Shipped in v0.2.0: black-frame / frozen-frame detection — the visual
+counterpart of dead air.)
 
 Nothing on this list is promised on a date; items move when a real
 pipeline failure promotes them.

@@ -108,7 +108,7 @@ included, so a white right column also raises the top and bottom
 ratios by its share of those bands. The worst ratio per edge across
 the sampled frames decides: above **3 %** fails that edge.
 
-**Flags.** None in v0.1.0 — the 15 % band, the ≥ 250 threshold, and
+**Flags.** None — the 15 % band, the ≥ 250 threshold, and
 the 3 % limit are the production rule and are reported in the JSON
 details of every run.
 
@@ -117,7 +117,44 @@ An intentionally white scene trips it too — deliberately: in the
 pipeline this came from, the panel was broken far more often than it
 was intentional.
 
-### 5. caption — text clipped at the frame edge
+### 5. freeze-black — the picture stops, or disappears
+
+**The failure it catches.** Dead air has a visual counterpart, and it
+ships the same way: an encoder or compositor hang repeats one frame
+for seconds while the audio carries on, or a panel render fails and
+the picture drops to black mid-scene. Viewers read both as "the video
+froze" — and a contact-sheet spot check misses them exactly like it
+misses silence, because every sampled thumbnail looks plausible on
+its own.
+
+**How it works.** One ffmpeg pass samples the video at 2 fps, scaled
+to 96 px wide, as PPM frames (the same pure-Python parsing as the
+white-edge gate). For each sampled frame the mean Rec. 601 luma is
+computed; a frame at or below luma 12 counts as black, and a run of N
+black frames is N × 0.5 s of black picture. Consecutive frames are
+also compared by mean absolute per-channel difference: a difference
+at or below 1 (of 255) is a "frozen step", and a run of M frozen steps
+is M × 0.5 s during which the picture provably did not change.
+
+The freeze epsilon is deliberately tiny. A slow zoompan over a still
+panel — the normal look of illustrated shorts — moves pixels
+measurably between samples half a second apart; a truly repeated
+frame does not. Likewise, short black transitions under the limit
+are normal editing and pass.
+
+**Flags.**
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--max-black` | `1.5` | Longest tolerated continuous black picture, in seconds. |
+| `--max-freeze` | `3.0` | Longest tolerated frozen (unchanging) picture, in seconds. |
+
+**Reading a failure.** The summary names the defect, its duration,
+and where it starts: `black picture for 2.5s at 2.5s (limit 1.5s)`.
+The JSON details carry the longest black and frozen runs (seconds
+and start time) plus the number of frames sampled.
+
+### 6. caption — text clipped at the frame edge
 
 **The production failure.** A narration line was burnt into a 720 px
 wide vertical video at fontsize 60 and simply ran out of frame —
@@ -160,7 +197,7 @@ shorts-qc caption --width 720 --fontsize 60 --file narration-lines.txt
 In the originating pipeline this gate runs on the script before TTS:
 a failing line is rewritten, not squeezed.
 
-### 6. language — the TTS reads the script in the wrong language
+### 7. language — the TTS reads the script in the wrong language
 
 **The production failure.** A narration part came back from the TTS
 engine **in English**, even though the script fed to it was Japanese
@@ -208,6 +245,8 @@ segment", not as proof.
 | `--min-lufs` | `-24.0` | Loudness floor (LUFS). |
 | `--max-lufs` | `-10.0` | Loudness ceiling (LUFS). |
 | `--max-gap` | `2.5` | Max tolerated inside silence (seconds). |
+| `--max-black` | `1.5` | Max tolerated continuous black picture (seconds). |
+| `--max-freeze` | `3.0` | Max tolerated frozen picture (seconds). |
 | `--lang` | — | Expected narration language; enables the language gate. |
 | `--json` | off | Print the report as JSON instead of text. |
 
@@ -289,6 +328,25 @@ has 3 s of silence and a white right column built in; exit code `1`.)
       }
     },
     {
+      "name": "freeze-black",
+      "status": "pass",
+      "summary": "no black run over 1.5s and no frozen run over 3.0s across 18 sampled frame(s) (longest black 0.0s, longest freeze 0.0s)",
+      "details": {
+        "max_black": 1.5,
+        "max_freeze": 3.0,
+        "frames": 18,
+        "interval": 0.5,
+        "black": {
+          "longest_seconds": 0.0,
+          "longest_at": null
+        },
+        "freeze": {
+          "longest_seconds": 0.0,
+          "longest_at": null
+        }
+      }
+    },
+    {
       "name": "language",
       "status": "skip",
       "summary": "skipped: pip install faster-whisper (language gate not available)",
@@ -321,6 +379,12 @@ How to read it:
   white column; `top`/`bottom` ≈ 0.15 is that same column's share of
   the horizontal bands (54 px of 360 px). `left: 0.0` is the control:
   the untouched edge measures clean.
+- **`freeze-black.details`** — the longest black and frozen runs
+  found across the 18 frames sampled at 0.5 s intervals. Both are
+  zero here: this demo file's defects are audio and edges, not
+  picture motion. On the `stuck.mp4` demo in
+  [examples/](../examples/) the same fields report a 2.5 s black run
+  and a 3.5 s frozen run, and the gate fails.
 - **`language`** — skipped on this machine (no `faster-whisper`), and
   the summary says why. With the package installed this gate reports
   `pass`/`fail` based on the transcription instead.
