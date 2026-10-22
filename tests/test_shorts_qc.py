@@ -131,5 +131,82 @@ class SilenceParsingTests(unittest.TestCase):
         self.assertEqual(sq.parse_silence_gaps("no silence in here\n"), [])
 
 
+def solid_frame(value, width=10, height=10):
+    """One parsed PPM frame filled with a single grey value."""
+    return sq.parse_ppm_bytes(
+        make_ppm(width, height, lambda x, y: (value, value, value)))
+
+
+class FrameSeriesTests(unittest.TestCase):
+    def test_mean_luma_black_white_and_red(self):
+        self.assertEqual(sq.frame_mean_luma(*solid_frame(0)), 0.0)
+        self.assertAlmostEqual(sq.frame_mean_luma(*solid_frame(255)), 255.0)
+        red = sq.parse_ppm_bytes(make_ppm(4, 4, lambda x, y: (255, 0, 0)))
+        # Rec. 601 luma of pure red: 0.299 * 255.
+        self.assertAlmostEqual(sq.frame_mean_luma(*red), 76.245, places=2)
+
+    def test_mean_abs_diff(self):
+        _, _, black = solid_frame(0)
+        _, _, white = solid_frame(255)
+        self.assertEqual(sq.frame_mean_abs_diff(black, black), 0.0)
+        self.assertAlmostEqual(sq.frame_mean_abs_diff(black, white), 255.0)
+        # Different sizes cannot be the same picture: sentinel, no raise.
+        self.assertEqual(sq.frame_mean_abs_diff(black, white[:10]), 255.0)
+
+    def test_black_run_measured_in_seconds(self):
+        frames = ([solid_frame(80)] * 2 + [solid_frame(0)] * 4
+                  + [solid_frame(80)] * 2)
+        report = sq.analyze_frame_series(frames, interval=0.5)
+        self.assertEqual(report["frames"], 8)
+        self.assertEqual(report["black"]["longest_seconds"], 2.0)
+        self.assertEqual(report["black"]["longest_at"], 1.0)
+
+    def test_black_threshold_boundary(self):
+        # Mean luma exactly at BLACK_LUMA_MAX counts as black; above does not.
+        at_limit = sq.parse_ppm_bytes(
+            make_ppm(10, 10, lambda x, y: (12, 12, 12)))
+        report = sq.analyze_frame_series([at_limit], interval=0.5)
+        self.assertEqual(report["black"]["longest_seconds"], 0.5)
+        report = sq.analyze_frame_series([solid_frame(40)], interval=0.5)
+        self.assertEqual(report["black"]["longest_seconds"], 0.0)
+        self.assertIsNone(report["black"]["longest_at"])
+
+    def test_frozen_run_measured_in_seconds(self):
+        # 8 identical frames -> 7 frozen steps -> 3.5 s of proven stillness.
+        report = sq.analyze_frame_series([solid_frame(80)] * 8, interval=0.5)
+        self.assertEqual(report["freeze"]["longest_seconds"], 3.5)
+        self.assertEqual(report["freeze"]["longest_at"], 0.0)
+
+    def test_changing_picture_is_not_frozen(self):
+        frames = [solid_frame(0), solid_frame(255)] * 4
+        report = sq.analyze_frame_series(frames, interval=0.5)
+        self.assertEqual(report["freeze"]["longest_seconds"], 0.0)
+        self.assertIsNone(report["freeze"]["longest_at"])
+        # Alternating black frames: longest black run is a single frame.
+        self.assertEqual(report["black"]["longest_seconds"], 0.5)
+
+    def test_freeze_run_reports_its_start(self):
+        frames = ([solid_frame(10), solid_frame(200)]
+                  + [solid_frame(90)] * 5 + [solid_frame(30)])
+        report = sq.analyze_frame_series(frames, interval=0.5)
+        # Frames 2..6 are identical: 4 frozen steps = 2.0 s, starting
+        # at frame 2 (t = 1.0 s).
+        self.assertEqual(report["freeze"]["longest_seconds"], 2.0)
+        self.assertEqual(report["freeze"]["longest_at"], 1.0)
+
+    def test_empty_series(self):
+        report = sq.analyze_frame_series([], interval=0.5)
+        self.assertEqual(report["frames"], 0)
+        self.assertEqual(report["black"]["longest_seconds"], 0.0)
+        self.assertEqual(report["freeze"]["longest_seconds"], 0.0)
+
+    def test_mismatched_frame_sizes_do_not_crash(self):
+        small = solid_frame(80, width=10, height=10)
+        big = solid_frame(80, width=20, height=10)
+        report = sq.analyze_frame_series([small, big, big], interval=0.5)
+        # small->big is "different" (sentinel); big->big is frozen.
+        self.assertEqual(report["freeze"]["longest_seconds"], 0.5)
+
+
 if __name__ == "__main__":
     unittest.main()

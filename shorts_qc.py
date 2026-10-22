@@ -7,7 +7,9 @@ Born from real production failures in a daily faceless-YouTube pipeline:
 * a TTS part silently reading Japanese text in English,
 * scenes padded with seconds of dead air,
 * AI panels whose art fades to white on one edge,
-* dialogue mixed far quieter than the rest of the video.
+* dialogue mixed far quieter than the rest of the video,
+* a render hang repeating one frame for seconds, or dropping the
+  picture to black mid-video.
 
 Each gate in this file checks one of those failure modes with ffmpeg /
 ffprobe (required on PATH) and pure standard-library Python.
@@ -49,6 +51,12 @@ EDGE_WHITE_THRESHOLD = 0.03    # >3% near-white pixels in a band = failed edge
 EDGE_NEAR_WHITE = 250          # all RGB channels >= this count as "white"
 FRAME_FRACTIONS = (0.1, 0.3, 0.5, 0.7, 0.9)
 EDGE_TRIM_SECONDS = 0.3        # ignore silence touching the very start/end
+FRAME_SAMPLE_FPS = 2.0         # sampling rate for the freeze/black gate
+FRAME_SAMPLE_WIDTH = 96        # sampled frames are scaled to this width (px)
+BLACK_LUMA_MAX = 12.0          # mean luma (0..255) at/below = black frame
+FREEZE_EPSILON = 1.0           # mean abs pixel diff at/below = same picture
+DEFAULT_MAX_BLACK = 1.5        # seconds of continuous black tolerated
+DEFAULT_MAX_FREEZE = 3.0       # seconds of frozen picture tolerated
 
 
 class ToolError(Exception):
@@ -394,7 +402,156 @@ def gate_white_edge(video: Path, total_duration: float) -> GateResult:
 
 
 # --------------------------------------------------------------------------
-# e. Caption-fit gate
+# e. Black-frame / frozen-frame gate
+# --------------------------------------------------------------------------
+
+_DIFF_SENTINEL = 255.0  # "definitely different" for incomparable frames
+
+
+def frame_mean_luma(width: int, height: int, rgb: bytes) -> float:
+    """Mean perceived luminance (Rec. 601 luma) of an RGB frame, 0..255."""
+    total = width * height
+    if total == 0:
+        return 0.0
+    acc = 0.0
+    for off in range(0, total * 3, 3):
+        acc += 0.299 * rgb[off] + 0.587 * rgb[off + 1] + 0.114 * rgb[off + 2]
+    return acc / total
+
+
+def frame_mean_abs_diff(rgb_a: bytes, rgb_b: bytes) -> float:
+    """Mean absolute per-channel difference between two frames, 0..255.
+
+    Frames of different sizes cannot be the same picture; return the
+    maximum sentinel instead of raising.
+    """
+    if len(rgb_a) != len(rgb_b):
+        return _DIFF_SENTINEL
+    if not rgb_a:
+        return 0.0
+    acc = 0
+    for i in range(len(rgb_a)):
+        acc += abs(rgb_a[i] - rgb_b[i])
+    return acc / len(rgb_a)
+
+
+def _longest_run(flags: list[bool]) -> tuple[int, int]:
+    """(start_index, length) of the longest run of True in flags."""
+    best_start, best_len = 0, 0
+    cur_start, cur_len = 0, 0
+    for i, flag in enumerate(flags):
+        if flag:
+            if cur_len == 0:
+                cur_start = i
+            cur_len += 1
+            if cur_len > best_len:
+                best_start, best_len = cur_start, cur_len
+        else:
+            cur_len = 0
+    return best_start, best_len
+
+
+def analyze_frame_series(frames: list[tuple[int, int, bytes]],
+                         interval: float) -> dict:
+    """Black / frozen analysis of frames sampled every `interval` seconds.
+
+    Pure function (no ffmpeg) so it is unit-testable on synthetic frames.
+    A run of N black frames is N * interval seconds of black picture.
+    A run of M consecutive "same as the previous frame" steps is
+    M * interval seconds during which the picture provably did not
+    change (a frozen segment of M + 1 frames spans at least that long).
+    """
+    lumas = [frame_mean_luma(w, h, rgb) for (w, h, rgb) in frames]
+    black_flags = [luma <= BLACK_LUMA_MAX for luma in lumas]
+    b_start, b_len = _longest_run(black_flags)
+    frozen_steps = [
+        frame_mean_abs_diff(frames[i][2], frames[i - 1][2]) <= FREEZE_EPSILON
+        for i in range(1, len(frames))
+    ]
+    f_start, f_len = _longest_run(frozen_steps)
+    return {
+        "frames": len(frames),
+        "interval": interval,
+        "black": {
+            "longest_seconds": round(b_len * interval, 3),
+            "longest_at": round(b_start * interval, 3) if b_len else None,
+        },
+        "freeze": {
+            # f_len frozen steps begin at step index f_start, i.e. the
+            # picture was already static at frame f_start.
+            "longest_seconds": round(f_len * interval, 3),
+            "longest_at": round(f_start * interval, 3) if f_len else None,
+        },
+    }
+
+
+def gate_freeze_black(video: Path, max_black: float,
+                      max_freeze: float) -> GateResult:
+    """Detect black holes and frozen picture from sampled frames.
+
+    The visual counterpart of the dead-air gate: an encoder hang repeats
+    one frame for seconds; a failed panel render drops the picture to
+    black while the narration carries on. Frames are sampled at
+    FRAME_SAMPLE_FPS, scaled down to FRAME_SAMPLE_WIDTH px, in a single
+    ffmpeg pass, then analysed by analyze_frame_series.
+
+    The freeze epsilon is deliberately tiny (a mean per-channel
+    difference of 1 out of 255): a slow zoompan over a still panel —
+    the normal look of this pipeline — moves pixels measurably at this
+    sampling rate, while a truly repeated frame does not. Short black
+    transitions under --max-black are likewise tolerated.
+    """
+    ffmpeg = _require_binary("ffmpeg")
+    interval = 1.0 / FRAME_SAMPLE_FPS
+    frames: list[tuple[int, int, bytes]] = []
+    with tempfile.TemporaryDirectory(prefix="shortsqc-fb-") as tmp:
+        pattern = str(Path(tmp) / "f_%05d.ppm")
+        proc = _run([
+            ffmpeg, "-hide_banner", "-loglevel", "error",
+            "-i", str(video),
+            "-vf", f"fps={FRAME_SAMPLE_FPS},scale={FRAME_SAMPLE_WIDTH}:-1",
+            "-f", "image2", "-c:v", "ppm", pattern,
+        ])
+        if proc.returncode != 0:
+            return GateResult(
+                "freeze-black", "error",
+                f"frame sampling failed: {proc.stderr.strip()[:200]}", {})
+        for path in sorted(Path(tmp).glob("f_*.ppm")):
+            try:
+                frames.append(parse_ppm_bytes(path.read_bytes()))
+            except ValueError:
+                continue
+    if not frames:
+        return GateResult("freeze-black", "error",
+                          "could not sample any frame for the "
+                          "freeze/black check", {})
+    report = analyze_frame_series(frames, interval)
+    black = report["black"]
+    freeze = report["freeze"]
+    details = {"max_black": max_black, "max_freeze": max_freeze, **report}
+    problems = []
+    if black["longest_seconds"] > max_black:
+        problems.append(
+            f"black picture for {black['longest_seconds']}s at "
+            f"{black['longest_at']}s (limit {max_black}s)")
+    if freeze["longest_seconds"] > max_freeze:
+        problems.append(
+            f"frozen picture for {freeze['longest_seconds']}s at "
+            f"{freeze['longest_at']}s (limit {max_freeze}s)")
+    if problems:
+        return GateResult("freeze-black", "fail", "; ".join(problems),
+                          details)
+    return GateResult(
+        "freeze-black", "pass",
+        f"no black run over {max_black}s and no frozen run over "
+        f"{max_freeze}s across {report['frames']} sampled frame(s) "
+        f"(longest black {black['longest_seconds']}s, "
+        f"longest freeze {freeze['longest_seconds']}s)",
+        details)
+
+
+# --------------------------------------------------------------------------
+# f. Caption-fit gate
 # --------------------------------------------------------------------------
 
 def caption_capacity(width_px: int, fontsize: float) -> int:
@@ -472,7 +629,7 @@ def run_caption(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
-# f. Language gate (optional, faster-whisper)
+# g. Language gate (optional, faster-whisper)
 # --------------------------------------------------------------------------
 
 _LATIN_RUN_RE = re.compile(r"[A-Za-z]{4,}")
@@ -552,6 +709,7 @@ def run_check(args: argparse.Namespace) -> int:
         gate_loudness(video, args.min_lufs, args.max_lufs),
         gate_dead_air(video, info["duration"], args.max_gap),
         gate_white_edge(video, info["duration"]),
+        gate_freeze_black(video, args.max_black, args.max_freeze),
     ]
     if args.lang:
         gates.append(gate_language(video, args.lang))
@@ -587,7 +745,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="shorts-qc",
         description="Quality gates for AI-generated short-form video "
-                    "(probe, loudness, dead air, white edges, caption fit, language).",
+                    "(probe, loudness, dead air, white edges, black/frozen "
+                    "frames, caption fit, language).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -602,6 +761,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_check.add_argument("--max-gap", type=float, default=DEFAULT_MAX_GAP,
                          help=f"max tolerated inside silence gap in seconds "
                               f"(default {DEFAULT_MAX_GAP})")
+    p_check.add_argument("--max-black", type=float, default=DEFAULT_MAX_BLACK,
+                         help=f"max tolerated continuous black picture in "
+                              f"seconds (default {DEFAULT_MAX_BLACK})")
+    p_check.add_argument("--max-freeze", type=float, default=DEFAULT_MAX_FREEZE,
+                         help=f"max tolerated frozen (unchanging) picture in "
+                              f"seconds (default {DEFAULT_MAX_FREEZE})")
     p_check.add_argument("--lang", default=None,
                          help="expected narration language, e.g. ja "
                               "(enables the optional faster-whisper gate)")
