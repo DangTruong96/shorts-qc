@@ -270,3 +270,143 @@ class DeadAirNoAudioTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AdversarialRound2Tests(unittest.TestCase):
+    """Round-2 adversarial pass: display rotation, cover-art streams,
+    hostile caption files, lying duration metadata, invalid limits."""
+
+    def probe_with(self, streams, duration="9.0"):
+        payload = {"streams": streams, "format": {"duration": duration}}
+        proc = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(payload), stderr="")
+        with mock.patch.object(sq, "_require_binary",
+                               return_value="ffprobe"), \
+                mock.patch.object(sq, "_run", return_value=proc):
+            return sq.probe_video(Path("clip.mp4"))
+
+    # -- rotation ----------------------------------------------------
+
+    def test_display_rotation_swaps_dimensions(self):
+        # Regression: a phone-style portrait clip stored as 1280x720
+        # with a -90 display matrix was reported as landscape and
+        # failed --expect 9:16, while the frame gates (which decode
+        # with autorotation) saw the portrait picture.
+        info = self.probe_with([
+            {"codec_type": "video", "width": 1280, "height": 720,
+             "avg_frame_rate": "30/1",
+             "side_data_list": [{"rotation": -90}]},
+            {"codec_type": "audio"},
+        ])
+        self.assertEqual((info["width"], info["height"]), (720, 1280))
+        self.assertEqual(info["orientation"], "portrait")
+        self.assertEqual(info["rotation"], 270)
+
+    def test_legacy_rotate_tag_swaps_dimensions(self):
+        info = self.probe_with([
+            {"codec_type": "video", "width": 1280, "height": 720,
+             "avg_frame_rate": "30/1", "tags": {"rotate": "90"}},
+        ])
+        self.assertEqual((info["width"], info["height"]), (720, 1280))
+        self.assertEqual(info["rotation"], 90)
+
+    def test_unrotated_stream_unchanged(self):
+        info = self.probe_with([
+            {"codec_type": "video", "width": 1280, "height": 720,
+             "avg_frame_rate": "30/1"},
+        ])
+        self.assertEqual((info["width"], info["height"]), (1280, 720))
+        self.assertEqual(info["rotation"], 0)
+
+    def test_180_rotation_does_not_swap(self):
+        info = self.probe_with([
+            {"codec_type": "video", "width": 1280, "height": 720,
+             "avg_frame_rate": "30/1",
+             "side_data_list": [{"rotation": 180}]},
+        ])
+        self.assertEqual((info["width"], info["height"]), (1280, 720))
+
+    # -- attached pictures --------------------------------------------
+
+    def test_cover_art_is_not_a_video_stream(self):
+        # Regression: an audio file with embedded cover art (renamed
+        # to .mp4) passed the probe as a "500x500, 90000 fps video".
+        with self.assertRaises(sq.ToolError) as ctx:
+            self.probe_with([
+                {"codec_type": "audio"},
+                {"codec_type": "video", "width": 500, "height": 500,
+                 "avg_frame_rate": "90000/1",
+                 "disposition": {"attached_pic": 1}},
+            ])
+        self.assertIn("no video stream", str(ctx.exception))
+
+    def test_real_video_preferred_over_cover_art(self):
+        info = self.probe_with([
+            {"codec_type": "audio"},
+            {"codec_type": "video", "width": 500, "height": 500,
+             "disposition": {"attached_pic": 1}},
+            {"codec_type": "video", "width": 720, "height": 1280,
+             "avg_frame_rate": "30/1",
+             "disposition": {"attached_pic": 0}},
+        ])
+        self.assertEqual((info["width"], info["height"]), (720, 1280))
+
+    # -- caption files -------------------------------------------------
+
+    def _caption_rc(self, path):
+        import argparse, contextlib, io
+        args = argparse.Namespace(lines=[], file=str(path), width=720,
+                                  fontsize=60.0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = sq.run_caption(args)
+        return rc, out.getvalue()
+
+    def test_caption_bom_does_not_inflate_first_line(self):
+        # Regression: a UTF-8 BOM counted as 0.55 width units, so a
+        # line exactly at capacity was falsely reported as clipped.
+        import codecs, tempfile
+        with tempfile.NamedTemporaryFile("wb", delete=False) as fh:
+            fh.write(codecs.BOM_UTF8 + ("あ" * 11 + "\n").encode("utf-8"))
+            path = fh.name
+        rc, out = self._caption_rc(path)
+        self.assertEqual(rc, sq.EXIT_PASS, out)
+        self.assertIn("11.00/11", out)
+
+    def test_caption_non_utf8_is_clean_error(self):
+        # Regression: a Shift-JIS caption file (Windows Notepad "ANSI")
+        # crashed with an uncaught UnicodeDecodeError traceback.
+        import tempfile
+        with tempfile.NamedTemporaryFile("wb", delete=False) as fh:
+            fh.write("こんにちは世界\n".encode("shift_jis"))
+            path = fh.name
+        rc, _ = self._caption_rc(path)
+        self.assertEqual(rc, sq.EXIT_ERROR)
+
+    def test_caption_width_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            sq.caption_capacity(0, 60)
+
+    # -- lying duration / dead-air --------------------------------------
+
+    def test_last_timecode_reads_ffmpeg_progress(self):
+        stderr = ("frame= 10 fps=5 time=00:00:02.00 bitrate=1x\n"
+                  "frame= 20 fps=5 time=00:00:04.25 bitrate=1x\n")
+        self.assertEqual(sq._last_timecode(stderr), 4.25)
+        self.assertIsNone(sq._last_timecode("no progress here"))
+
+    # -- invalid limits ---------------------------------------------------
+
+    def test_negative_threshold_is_usage_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            sq.build_parser().parse_args(
+                ["check", "x.mp4", "--max-gap", "-1"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_inverted_loudness_range_is_usage_error(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as fh:
+            rc = sq.main(["check", fh.name,
+                          "--min-lufs=-10", "--max-lufs=-24"])
+        self.assertEqual(rc, sq.EXIT_ERROR)

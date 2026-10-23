@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shorts-qc"
-version = "0.2.1"
+version = "0.2.2"
 description = "Quality gates for AI-generated short-form video: loudness, dead air, white-edge panels, black/frozen frames, caption fit, narration language."
 readme = "README.md"
 license = { text = "MIT" }

@@ -3,6 +3,45 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.2] - 2026-10-23
+
+### Fixed
+
+- **Display rotation is honoured by the probe gate.** A clip stored
+  landscape with a 90/270-degree display matrix (phone portrait
+  footage) was reported with its stored dimensions and failed
+  `--expect 9:16`, while the frame gates — which decode with
+  ffmpeg's autorotation — saw the portrait picture. The probe now
+  reads the Display Matrix side data (and the legacy `rotate` tag),
+  swaps width/height for quarter turns, and reports the rotation.
+- **Cover art is no longer mistaken for a video stream.** An audio
+  file with an embedded picture, renamed to `.mp4`, sailed through
+  the probe as a "500x500, 90000 fps" video and failed later gates
+  with confusing errors. Streams flagged `attached_pic` are now
+  ignored when selecting the picture track; a file with only cover
+  art gets the clear "no video stream" error.
+- **Frames and silence are no longer judged against a lying
+  duration.** When container metadata overstated the duration
+  (observed: an FLV claiming 600s for 4s of media), every white-edge
+  frame seek landed past the end of the file and the gate errored
+  on a playable video; a trailing silence could likewise be
+  "closed" at the fake duration. The white-edge gate now falls back
+  to the first frame when all fraction seeks fail, and dead-air
+  clamps gap judging to the last timecode ffmpeg actually
+  processed.
+- **Caption files: BOM stripped, non-UTF-8 rejected cleanly.** A
+  UTF-8 BOM counted as 0.55 width units and failed a line that was
+  exactly at capacity; a Shift-JIS file crashed with an uncaught
+  `UnicodeDecodeError`. Files are now read as UTF-8-SIG, and
+  undecodable input exits 2 with a clear message.
+- **Invalid limits are usage errors, not verdicts.** Negative
+  `--max-gap` / `--max-black` / `--max-freeze` values made a clean
+  video FAIL with nonsense summaries ("black picture for 0.0s at
+  Nones (limit -5.0s)"); they now exit 2 at parse time, as does an
+  inverted `--min-lufs` > `--max-lufs` range. `--width` for
+  captions must be positive too.
+- 12 regression tests — 40 tests total.
+
 ## [0.2.1] - 2026-10-23
 
 ### Fixed

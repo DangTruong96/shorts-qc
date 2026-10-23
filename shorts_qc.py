@@ -108,13 +108,54 @@ class GateResult:
 # a. Probe gate
 # --------------------------------------------------------------------------
 
+def _stream_rotation(stream: dict) -> int:
+    """Display rotation in degrees for a stream (0 when unrotated).
+
+    Modern files carry it as Display Matrix side data; older MP4s as
+    a `rotate` stream tag. Both describe how the stored picture is
+    meant to be DISPLAYED — players and ffmpeg's own decoder honour
+    it, so geometry checks must too.
+    """
+    for side in stream.get("side_data_list") or []:
+        if isinstance(side, dict) and "rotation" in side:
+            try:
+                return int(round(float(side["rotation"]))) % 360
+            except (TypeError, ValueError):
+                pass
+    tag = (stream.get("tags") or {}).get("rotate")
+    if tag is not None:
+        try:
+            return int(round(float(tag))) % 360
+        except (TypeError, ValueError):
+            pass
+    return 0
+
+
+def _is_attached_pic(stream: dict) -> bool:
+    """True for cover-art streams (an audio file's embedded picture).
+
+    ffprobe reports them as codec_type "video"; treating one as the
+    picture track makes an audio file sail through the probe gate
+    with the cover's dimensions and a nonsense frame rate.
+    """
+    return (stream.get("disposition") or {}).get("attached_pic") == 1
+
+
 def probe_video(video: Path) -> dict:
     """Return ffprobe facts: duration, width, height, fps, orientation,
-    and whether the file carries an audio stream."""
+    and whether the file carries an audio stream.
+
+    Width/height are the DISPLAY dimensions: when the stream carries
+    a 90/270-degree display rotation they are swapped, matching what
+    players show and what ffmpeg extracts in the frame gates.
+    """
     ffprobe = _require_binary("ffprobe")
     proc = _run([
         ffprobe, "-v", "error",
         "-show_entries", "stream=codec_type,width,height,avg_frame_rate,r_frame_rate",
+        "-show_entries", "stream_side_data=rotation",
+        "-show_entries", "stream_tags=rotate",
+        "-show_entries", "stream_disposition=attached_pic",
         "-show_entries", "format=duration",
         "-of", "json",
         str(video),
@@ -127,7 +168,9 @@ def probe_video(video: Path) -> dict:
         duration = float(data["format"]["duration"])
     except (ValueError, KeyError, IndexError) as exc:
         raise ToolError(f"could not parse ffprobe output for {video}: {exc}") from exc
-    stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    stream = next((s for s in streams
+                   if s.get("codec_type") == "video"
+                   and not _is_attached_pic(s)), None)
     if stream is None:
         raise ToolError(
             f"no video stream found in {video} "
@@ -137,6 +180,9 @@ def probe_video(video: Path) -> dict:
         height = int(stream["height"])
     except (ValueError, KeyError) as exc:
         raise ToolError(f"could not parse ffprobe output for {video}: {exc}") from exc
+    rotation = _stream_rotation(stream)
+    if rotation in (90, 270):
+        width, height = height, width
     has_audio = any(s.get("codec_type") == "audio" for s in streams)
 
     fps = 0.0
@@ -166,6 +212,7 @@ def probe_video(video: Path) -> dict:
         "orientation": orientation,
         "aspect": round(width / height, 4) if height else 0.0,
         "has_audio": has_audio,
+        "rotation": rotation,
     }
 
 
@@ -244,6 +291,22 @@ def gate_loudness(video: Path, min_lufs: float, max_lufs: float) -> GateResult:
 
 _SILENCE_START_RE = re.compile(r"silence_start:\s*(-?[\d.]+)")
 _SILENCE_END_RE = re.compile(r"silence_end:\s*(-?[\d.]+)\s*\|\s*silence_duration:\s*(-?[\d.]+)")
+_TIMECODE_RE = re.compile(r"time=(\d+):(\d+):([\d.]+)")
+
+
+def _last_timecode(stderr_text: str) -> float | None:
+    """Last `time=` progress marker in ffmpeg output, in seconds.
+
+    ffmpeg's own progress line reports how much media it actually
+    processed, which is ground truth when the container's duration
+    metadata lies (some FLV/MP4 metadata claims hours for a
+    seconds-long file): a trailing silence can never extend past it.
+    """
+    last = None
+    for match in _TIMECODE_RE.finditer(stderr_text):
+        last = (int(match.group(1)) * 3600 + int(match.group(2)) * 60
+                + float(match.group(3)))
+    return last
 
 
 def parse_silence_gaps(stderr_text: str, duration: float | None = None) -> list[dict]:
@@ -296,7 +359,14 @@ def gate_dead_air(video: Path, total_duration: float, max_gap: float,
         "-af", f"silencedetect=noise={DEFAULT_SILENCE_NOISE}:d={DEFAULT_SILENCE_MIN_DURATION}",
         "-f", "null", "-",
     ])
-    gaps = parse_silence_gaps(proc.stderr, duration=total_duration)
+    # The container's duration can lie (bad metadata); ffmpeg's own
+    # progress timecode says how much media it really processed.
+    # Never judge gaps against an end point past that.
+    media_end = _last_timecode(proc.stderr)
+    eff_duration = total_duration
+    if media_end:
+        eff_duration = min(total_duration, media_end)
+    gaps = parse_silence_gaps(proc.stderr, duration=eff_duration)
 
     # Ignore silence that only touches the first / last 0.3 s (normal
     # head/tail padding): clip every gap to the "inside" of the file and
@@ -304,7 +374,7 @@ def gate_dead_air(video: Path, total_duration: float, max_gap: float,
     offenders = []
     for gap in gaps:
         inside_start = max(gap["start"], EDGE_TRIM_SECONDS)
-        inside_end = min(gap["end"], total_duration - EDGE_TRIM_SECONDS) if total_duration else gap["end"]
+        inside_end = min(gap["end"], eff_duration - EDGE_TRIM_SECONDS) if eff_duration else gap["end"]
         inside = round(inside_end - inside_start, 3)
         if inside > max_gap:
             offenders.append({**gap, "inside_duration": inside})
@@ -390,6 +460,15 @@ def gate_white_edge(video: Path, total_duration: float) -> GateResult:
     worst: dict[str, float] = {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}
     frames_checked = 0
     with tempfile.TemporaryDirectory(prefix="shortsqc-") as tmp:
+
+        def absorb(path: Path) -> None:
+            nonlocal frames_checked
+            width, height, rgb = parse_ppm_bytes(path.read_bytes())
+            ratios = white_edge_ratios(width, height, rgb)
+            for edge, ratio in ratios.items():
+                worst[edge] = max(worst[edge], ratio)
+            frames_checked += 1
+
         for i, frac in enumerate(FRAME_FRACTIONS):
             at = max(0.0, total_duration * frac)
             out = Path(tmp) / f"frame_{i}.ppm"
@@ -400,11 +479,20 @@ def gate_white_edge(video: Path, total_duration: float) -> GateResult:
             ])
             if proc.returncode != 0 or not out.exists():
                 continue
-            width, height, rgb = parse_ppm_bytes(out.read_bytes())
-            ratios = white_edge_ratios(width, height, rgb)
-            for edge, ratio in ratios.items():
-                worst[edge] = max(worst[edge], ratio)
-            frames_checked += 1
+            absorb(out)
+        if frames_checked == 0:
+            # Every fraction seek landed past the real end of the
+            # media — the duration the probe reported cannot be
+            # trusted (bad container metadata). Fall back to the
+            # first frame instead of erroring on a playable file.
+            out = Path(tmp) / "frame_first.ppm"
+            proc = _run([
+                ffmpeg, "-hide_banner", "-loglevel", "error",
+                "-i", str(video),
+                "-frames:v", "1", "-f", "image2", "-c:v", "ppm", str(out),
+            ])
+            if proc.returncode == 0 and out.exists():
+                absorb(out)
     if frames_checked == 0:
         return GateResult("white-edge", "error",
                           "could not extract any frame for the white-edge check", {})
@@ -589,6 +677,8 @@ def caption_capacity(width_px: int, fontsize: float) -> int:
     """
     if fontsize <= 0:
         raise ValueError("fontsize must be positive")
+    if width_px <= 0:
+        raise ValueError("width must be positive")
     return max(0, math.floor((width_px - fontsize) / fontsize))
 
 
@@ -622,9 +712,20 @@ def run_caption(args: argparse.Namespace) -> int:
         if not file_path.is_file():
             print(f"error: caption file not found: {file_path}", file=sys.stderr)
             return EXIT_ERROR
-        lines.extend(
-            ln.rstrip("\n") for ln in file_path.read_text(encoding="utf-8").splitlines()
-        )
+        try:
+            # utf-8-sig: a BOM (Notepad's default UTF-8 flavour) is
+            # stripped instead of silently inflating the first line's
+            # measured width by half a character.
+            text = file_path.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            print(f"error: caption file is not valid UTF-8: {file_path} "
+                  f"(re-save it as UTF-8 and retry)", file=sys.stderr)
+            return EXIT_ERROR
+        except OSError as exc:
+            print(f"error: cannot read caption file {file_path}: {exc}",
+                  file=sys.stderr)
+            return EXIT_ERROR
+        lines.extend(ln.rstrip("\n") for ln in text.splitlines())
     if not lines:
         print("error: no caption lines given (pass lines as arguments or --file)",
               file=sys.stderr)
@@ -720,6 +821,10 @@ def run_check(args: argparse.Namespace) -> int:
     if not video.is_file():
         print(f"error: video not found: {video}", file=sys.stderr)
         return EXIT_ERROR
+    if args.min_lufs > args.max_lufs:
+        print(f"error: --min-lufs ({args.min_lufs}) must not exceed "
+              f"--max-lufs ({args.max_lufs})", file=sys.stderr)
+        return EXIT_ERROR
     try:
         _require_binary("ffmpeg")
         probe_result, info = gate_probe(video, args.expect)
@@ -765,6 +870,20 @@ def run_check(args: argparse.Namespace) -> int:
 # CLI
 # --------------------------------------------------------------------------
 
+def _non_negative_float(text: str) -> float:
+    """argparse type for duration thresholds: negative values are a
+    usage error (exit 2), not a verdict — a negative limit makes even
+    a zero-length run "exceed" it and produced nonsense FAILs."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid number: {text!r}")
+    if value < 0:
+        raise argparse.ArgumentTypeError(
+            f"value must not be negative: {text!r}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="shorts-qc",
@@ -782,13 +901,16 @@ def build_parser() -> argparse.ArgumentParser:
                          help=f"loudness floor in LUFS (default {DEFAULT_MIN_LUFS})")
     p_check.add_argument("--max-lufs", type=float, default=DEFAULT_MAX_LUFS,
                          help=f"loudness ceiling in LUFS (default {DEFAULT_MAX_LUFS})")
-    p_check.add_argument("--max-gap", type=float, default=DEFAULT_MAX_GAP,
+    p_check.add_argument("--max-gap", type=_non_negative_float,
+                         default=DEFAULT_MAX_GAP,
                          help=f"max tolerated inside silence gap in seconds "
                               f"(default {DEFAULT_MAX_GAP})")
-    p_check.add_argument("--max-black", type=float, default=DEFAULT_MAX_BLACK,
+    p_check.add_argument("--max-black", type=_non_negative_float,
+                         default=DEFAULT_MAX_BLACK,
                          help=f"max tolerated continuous black picture in "
                               f"seconds (default {DEFAULT_MAX_BLACK})")
-    p_check.add_argument("--max-freeze", type=float, default=DEFAULT_MAX_FREEZE,
+    p_check.add_argument("--max-freeze", type=_non_negative_float,
+                         default=DEFAULT_MAX_FREEZE,
                          help=f"max tolerated frozen (unchanging) picture in "
                               f"seconds (default {DEFAULT_MAX_FREEZE})")
     p_check.add_argument("--lang", default=None,
