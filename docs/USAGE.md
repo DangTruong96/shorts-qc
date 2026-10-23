@@ -81,6 +81,11 @@ the file — silence touching only the first or last 0.3 s is treated as
 normal head/tail padding and ignored. A gap whose *inside* remainder
 exceeds the limit fails.
 
+A file with **no audio stream** reports this gate as an error, not a
+pass: there is no audio to measure silence in (ffmpeg itself exits 0
+on such a file without running the filter, which is exactly how a
+missing soundtrack once slipped through as "no gaps detected").
+
 **Flags.**
 
 | Flag | Default | Meaning |
@@ -276,7 +281,8 @@ has 3 s of silence and a white right column built in; exit code `1`.)
         "height": 640,
         "fps": 30.0,
         "orientation": "portrait",
-        "aspect": 0.5625
+        "aspect": 0.5625,
+        "has_audio": true
       }
     },
     {
@@ -366,7 +372,10 @@ How to read it:
   `skip` means "not verified" (missing optional dependency, or no
   `--lang` given) — never read it as a pass.
 - **`probe.details`** — the measured facts the aspect verdict is based
-  on; `aspect` is `width / height` (0.5625 = 9:16).
+  on; `aspect` is `width / height` (0.5625 = 9:16). `has_audio` says
+  whether the file carries an audio stream at all; when it is `false`
+  the loudness and dead-air gates report errors instead of measuring
+  nothing.
 - **`loudness.details.input_i_lufs`** — integrated loudness as
   measured by loudnorm (−21.92), with the enforced window next to it.
 - **`dead-air.details.offending_gaps`** — only the gaps that failed,

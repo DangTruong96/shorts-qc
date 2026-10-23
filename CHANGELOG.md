@@ -3,6 +3,25 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.1] - 2026-10-23
+
+### Fixed
+
+- **dead-air no longer passes vacuously on a video with no audio
+  stream.** ffmpeg exits 0 on such a file without ever running
+  `silencedetect`, so the gate parsed zero silence gaps and reported
+  PASS — on a file whose entire soundtrack is missing. The probe now
+  reports whether an audio stream exists (`has_audio` in the probe
+  details), and the dead-air gate reports an **error** for a file
+  with no audio track, mirroring the loudness gate's verdict on the
+  same file.
+- **A file with no video stream now gets a clear error.** An
+  audio-only file used to exit 2 with "could not parse ffprobe
+  output: list index out of range" — a leaked Python internal that
+  blamed the probe output. It now says the file has no video stream.
+- 5 regression tests for the probe's stream handling and the
+  dead-air no-audio case — 28 tests total.
+
 ## [0.2.0] - 2026-10-23
 
 ### Added
