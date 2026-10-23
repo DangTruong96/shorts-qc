@@ -109,12 +109,12 @@ class GateResult:
 # --------------------------------------------------------------------------
 
 def probe_video(video: Path) -> dict:
-    """Return ffprobe facts: duration, width, height, fps, orientation."""
+    """Return ffprobe facts: duration, width, height, fps, orientation,
+    and whether the file carries an audio stream."""
     ffprobe = _require_binary("ffprobe")
     proc = _run([
         ffprobe, "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate",
+        "-show_entries", "stream=codec_type,width,height,avg_frame_rate,r_frame_rate",
         "-show_entries", "format=duration",
         "-of", "json",
         str(video),
@@ -123,12 +123,21 @@ def probe_video(video: Path) -> dict:
         raise ToolError(f"ffprobe failed on {video}: {proc.stderr.strip()[:300]}")
     try:
         data = json.loads(proc.stdout)
-        stream = data["streams"][0]
-        width = int(stream["width"])
-        height = int(stream["height"])
+        streams = data["streams"]
         duration = float(data["format"]["duration"])
     except (ValueError, KeyError, IndexError) as exc:
         raise ToolError(f"could not parse ffprobe output for {video}: {exc}") from exc
+    stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if stream is None:
+        raise ToolError(
+            f"no video stream found in {video} "
+            f"(the file has no picture track — is it a video file?)")
+    try:
+        width = int(stream["width"])
+        height = int(stream["height"])
+    except (ValueError, KeyError) as exc:
+        raise ToolError(f"could not parse ffprobe output for {video}: {exc}") from exc
+    has_audio = any(s.get("codec_type") == "audio" for s in streams)
 
     fps = 0.0
     for key in ("avg_frame_rate", "r_frame_rate"):
@@ -156,6 +165,7 @@ def probe_video(video: Path) -> dict:
         "fps": round(fps, 3),
         "orientation": orientation,
         "aspect": round(width / height, 4) if height else 0.0,
+        "has_audio": has_audio,
     }
 
 
@@ -266,7 +276,20 @@ def parse_silence_gaps(stderr_text: str, duration: float | None = None) -> list[
     return gaps
 
 
-def gate_dead_air(video: Path, total_duration: float, max_gap: float) -> GateResult:
+def gate_dead_air(video: Path, total_duration: float, max_gap: float,
+                  has_audio: bool = True) -> GateResult:
+    if not has_audio:
+        # ffmpeg exits 0 on a file with no audio stream and simply
+        # never runs silencedetect, so without this check the gate
+        # parsed zero gaps and reported a vacuous PASS on a file whose
+        # entire soundtrack is missing. An error (like the loudness
+        # gate reports for the same file) is the honest verdict:
+        # there is no audio to measure silence in.
+        return GateResult(
+            "dead-air", "error",
+            "no audio stream to analyse "
+            "(silence detection needs an audio track)",
+            {"max_gap": max_gap, "all_gaps": []})
     ffmpeg = _require_binary("ffmpeg")
     proc = _run([
         ffmpeg, "-hide_banner", "-i", str(video),
@@ -707,7 +730,8 @@ def run_check(args: argparse.Namespace) -> int:
     gates: list[GateResult] = [
         probe_result,
         gate_loudness(video, args.min_lufs, args.max_lufs),
-        gate_dead_air(video, info["duration"], args.max_gap),
+        gate_dead_air(video, info["duration"], args.max_gap,
+                      has_audio=info["has_audio"]),
         gate_white_edge(video, info["duration"]),
         gate_freeze_black(video, args.max_black, args.max_freeze),
     ]

@@ -4,9 +4,12 @@ Run from the project root:
     python3 -m unittest discover -s tests -v
 """
 
+import json
+import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -206,6 +209,63 @@ class FrameSeriesTests(unittest.TestCase):
         report = sq.analyze_frame_series([small, big, big], interval=0.5)
         # small->big is "different" (sentinel); big->big is frozen.
         self.assertEqual(report["freeze"]["longest_seconds"], 0.5)
+
+
+class ProbeStreamTests(unittest.TestCase):
+    """probe_video stream selection (ffprobe stubbed: no ffmpeg needed)."""
+
+    def probe_with(self, streams, duration="9.0"):
+        payload = {"streams": streams, "format": {"duration": duration}}
+        proc = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(payload), stderr="")
+        with mock.patch.object(sq, "_require_binary",
+                               return_value="ffprobe"), \
+                mock.patch.object(sq, "_run", return_value=proc):
+            return sq.probe_video(Path("clip.mp4"))
+
+    def test_video_and_audio_streams(self):
+        info = self.probe_with([
+            {"codec_type": "video", "width": 360, "height": 640,
+             "avg_frame_rate": "30/1"},
+            {"codec_type": "audio"},
+        ])
+        self.assertEqual((info["width"], info["height"]), (360, 640))
+        self.assertEqual(info["fps"], 30.0)
+        self.assertTrue(info["has_audio"])
+
+    def test_video_only_stream_reports_no_audio(self):
+        info = self.probe_with([
+            {"codec_type": "video", "width": 360, "height": 640,
+             "avg_frame_rate": "30/1"},
+        ])
+        self.assertFalse(info["has_audio"])
+
+    def test_audio_only_file_is_a_clear_error(self):
+        # Regression: this used to surface as "could not parse ffprobe
+        # output: list index out of range" — an internal leak that
+        # blamed the output, when the file simply has no picture track.
+        with self.assertRaises(sq.ToolError) as ctx:
+            self.probe_with([{"codec_type": "audio"}])
+        self.assertIn("no video stream", str(ctx.exception))
+
+    def test_no_streams_at_all_is_a_clear_error(self):
+        with self.assertRaises(sq.ToolError) as ctx:
+            self.probe_with([])
+        self.assertIn("no video stream", str(ctx.exception))
+
+
+class DeadAirNoAudioTests(unittest.TestCase):
+    def test_no_audio_stream_is_an_error_not_a_vacuous_pass(self):
+        # Regression: ffmpeg exits 0 on a file with no audio stream
+        # without ever running silencedetect, so the gate parsed zero
+        # gaps and reported PASS — on a file whose entire soundtrack
+        # is missing. The loudness gate already errors on that file;
+        # dead-air must not claim a clean bill of health either.
+        result = sq.gate_dead_air(Path("noaudio.mp4"), 6.0, 2.5,
+                                  has_audio=False)
+        self.assertEqual(result.status, "error")
+        self.assertIn("no audio stream", result.summary)
+        self.assertFalse(result.ok)
 
 
 if __name__ == "__main__":
