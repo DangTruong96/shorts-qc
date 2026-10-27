@@ -220,7 +220,9 @@ assembled video. Two lessons are baked into this gate:
 package installed, the audio is extracted to a 16 kHz mono WAV,
 transcribed with the tiny model and automatic language detection,
 and any segment containing a run of ≥ 4 Latin-alphabet characters
-fails the gate. Only `ja` targets get the Latin-run rule in v0.1.0.
+fails the gate. Only `ja` targets get a check: any other `--lang`
+value reports `skip` (see below) instead of a PASS for a check that
+never ran.
 
 **Flags.**
 
@@ -231,7 +233,10 @@ fails the gate. Only `ja` targets get the Latin-run rule in v0.1.0.
 **When it skips.** If `faster-whisper` is not installed, the gate
 reports `skip` with the exact install hint and never crashes the run;
 if `--lang` is not given, it reports `skip` because there is no
-expectation to check against. A skip does not fail the run — but it
+expectation to check against; and if `--lang` names anything other
+than `ja`, it reports `skip` naming that target, because the gate
+implements no check for it — a PASS there would claim a verification
+that never happened. A skip does not fail the run — but it
 also does not mean the language was verified. In the production
 pipeline, the final-file language scan is a hard pre-delivery gate
 run separately for exactly that reason.

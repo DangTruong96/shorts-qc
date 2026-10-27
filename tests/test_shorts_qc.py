@@ -410,3 +410,95 @@ class AdversarialRound2Tests(unittest.TestCase):
             rc = sq.main(["check", fh.name,
                           "--min-lufs=-10", "--max-lufs=-24"])
         self.assertEqual(rc, sq.EXIT_ERROR)
+
+
+class LanguageGateTargetTests(unittest.TestCase):
+    """QA-loop round: a non-ja --lang target used to report PASS.
+
+    gate_language only ever implemented one check — Latin-alphabet
+    speech where Japanese narration was expected — but for any other
+    target it transcribed and then returned PASS with "no
+    wrong-language segments detected", a vacuous pass: the report
+    claimed a verification that never happened. Non-ja targets must
+    now report an explicit skip naming the unchecked target, and the
+    ja behaviour (fail on Latin segments, pass otherwise) is pinned
+    with a stubbed faster-whisper module (the real package is an
+    optional dependency and is not installed in CI either).
+    """
+
+    def _gate_with_stub(self, target, segment_texts):
+        import types
+
+        class Seg:
+            def __init__(self, text):
+                self.text = text
+
+        class FakeModel:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def transcribe(self, path, language=None):
+                return [Seg(t) for t in segment_texts], None
+
+        fake_mod = types.ModuleType("faster_whisper")
+        fake_mod.WhisperModel = FakeModel
+
+        def fake_run(cmd):
+            out = Path(cmd[-1])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"RIFF")
+            return mock.Mock(returncode=0, stderr="")
+
+        with mock.patch.dict(sys.modules, {"faster_whisper": fake_mod}), \
+                mock.patch.object(sq, "_run", side_effect=fake_run), \
+                mock.patch.object(sq, "_require_binary",
+                                  return_value="ffmpeg"):
+            return sq.gate_language(Path("clip.mp4"), target)
+
+    def test_non_ja_target_skips_instead_of_passing(self):
+        for target in ("en", "fr", "de"):
+            result = self._gate_with_stub(
+                target, ["Hello this is English speech"])
+            self.assertEqual(result.status, "skip")
+            self.assertTrue(result.ok)
+            self.assertIn(target, result.summary)
+            self.assertIn("not checked", result.summary)
+
+    def test_ja_target_still_fails_on_latin_segments(self):
+        result = self._gate_with_stub(
+            "ja", ["Hello this is English speech"])
+        self.assertEqual(result.status, "fail")
+
+    def test_ja_target_passes_without_latin_segments(self):
+        result = self._gate_with_stub(
+            "ja", ["こんにちは、今日はいい天気ですね"])
+        self.assertEqual(result.status, "pass")
+
+
+class NotAFileMessageTests(unittest.TestCase):
+    """QA-loop round: a directory passed as the input was reported
+    as "not found", sending the user looking in the wrong place.
+    The exit code was already right (2); only the wording was wrong."""
+
+    def test_check_directory_reports_not_a_file(self):
+        import contextlib
+        import io
+        import tempfile
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = sq.main(["check", tempfile.gettempdir()])
+        self.assertEqual(rc, sq.EXIT_ERROR)
+        self.assertIn("not a file", err.getvalue())
+
+    def test_caption_directory_reports_not_a_file(self):
+        import argparse
+        import contextlib
+        import io
+        import tempfile
+        args = argparse.Namespace(lines=[], file=tempfile.gettempdir(),
+                                  width=720, fontsize=60.0)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = sq.run_caption(args)
+        self.assertEqual(rc, sq.EXIT_ERROR)
+        self.assertIn("not a file", err.getvalue())

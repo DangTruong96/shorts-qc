@@ -3,6 +3,27 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.3] - 2026-10-27
+
+### Fixed
+
+- **A non-`ja` `--lang` target no longer reports a vacuous PASS.**
+  The language gate only ever implemented one check — Latin-alphabet
+  speech where Japanese narration was expected — but for any other
+  target (`--lang en`, `--lang fr`, ...) it transcribed the audio and
+  then reported PASS with "no wrong-language segments detected", a
+  verdict for a check that never ran. Non-`ja` targets now report an
+  explicit `skip` naming the target that was not checked, matching
+  the gate's existing skip behaviour when `faster-whisper` is missing.
+  The `ja` behaviour is unchanged (fail on Latin-alphabet segments,
+  pass otherwise).
+- **A directory passed as the input is no longer reported as "not
+  found".** Both `check` (video path) and `caption` (`--file`) now
+  say "not a file" when the path exists but is not a file. The exit
+  code was already correct (2); only the wording sent the user
+  looking in the wrong place.
+- 5 regression tests — 45 tests total.
+
 ## [0.2.2] - 2026-10-23
 
 ### Fixed

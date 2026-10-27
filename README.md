@@ -52,7 +52,7 @@ runs the same way every time. That is all this tool is.
 | **dead-air** | ffmpeg `silencedetect` (noise=−40 dB, min duration 1.2 s). Fails if any silence gap *inside* the file exceeds `--max-gap` (default 2.5 s). Gaps touching only the first/last 0.3 s are ignored. A file with no audio stream at all reports an error here rather than a vacuous pass. |
 | **white-edge** | Samples up to 5 frames evenly across the video, parses them as PPM in pure Python, and measures near-white pixels (all channels ≥ 250) in the outer 15% band of each edge. An edge band above **3%** near-white fails. |
 | **freeze-black** | Samples frames at 2 fps (scaled to 96 px wide) in one ffmpeg pass and measures them in pure Python: fails on continuous black picture over **1.5 s** (`--max-black`) or a frozen, unchanging picture over **3.0 s** (`--max-freeze`). The visual counterpart of dead air. |
-| **language** *(optional)* | With `faster-whisper` installed and `--lang ja`, extracts the audio, transcribes with automatic language detection, and fails if any segment contains a run of ≥ 4 Latin-alphabet characters. Without the package it prints a clear `skipped` notice — it never crashes. |
+| **language** *(optional)* | With `faster-whisper` installed and `--lang ja`, extracts the audio, transcribes with automatic language detection, and fails if any segment contains a run of ≥ 4 Latin-alphabet characters. Any other `--lang` value reports `skip` — the gate only checks Japanese narration. Without the package it prints a clear `skipped` notice — it never crashes. |
 
 `shorts-qc caption` is the caption-fit gate on its own:
 

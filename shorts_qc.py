@@ -710,7 +710,14 @@ def run_caption(args: argparse.Namespace) -> int:
     if args.file:
         file_path = Path(args.file)
         if not file_path.is_file():
-            print(f"error: caption file not found: {file_path}", file=sys.stderr)
+            # Same distinction as the check command: a directory
+            # passed as --file exists but is not a readable file.
+            if file_path.exists():
+                print(f"error: caption file is not a file: {file_path}",
+                      file=sys.stderr)
+            else:
+                print(f"error: caption file not found: {file_path}",
+                      file=sys.stderr)
             return EXIT_ERROR
         try:
             # utf-8-sig: a BOM (Notepad's default UTF-8 flavour) is
@@ -763,7 +770,21 @@ def gate_language(video: Path, target_lang: str) -> GateResult:
     """Detect narration in the wrong language (needs faster-whisper).
 
     Skips cleanly — never crashes — when faster-whisper is not installed.
+
+    Only `ja` targets get a real check (the Latin-alphabet rule below).
+    For any other target there is no check to run, so reporting PASS
+    would be a vacuous pass — the gate ran, transcribed segments, and
+    verified nothing — while the report read "no wrong-language
+    segments detected". Report an explicit skip instead, naming the
+    target that was not checked.
     """
+    if target_lang != "ja":
+        return GateResult(
+            "language", "skip",
+            f"skipped: language gate only checks Japanese narration "
+            f"(--lang ja); target '{target_lang}' is not checked",
+            {"target_lang": target_lang},
+        )
     try:
         from faster_whisper import WhisperModel  # type: ignore
     except ImportError:
@@ -819,7 +840,13 @@ def gate_language(video: Path, target_lang: str) -> GateResult:
 def run_check(args: argparse.Namespace) -> int:
     video = Path(args.video)
     if not video.is_file():
-        print(f"error: video not found: {video}", file=sys.stderr)
+        # A directory (or other non-file path) exists but is not a
+        # video; saying "not found" for it sends the user looking in
+        # the wrong place.
+        if video.exists():
+            print(f"error: video path is not a file: {video}", file=sys.stderr)
+        else:
+            print(f"error: video not found: {video}", file=sys.stderr)
         return EXIT_ERROR
     if args.min_lufs > args.max_lufs:
         print(f"error: --min-lufs ({args.min_lufs}) must not exceed "
