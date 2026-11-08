@@ -502,3 +502,155 @@ class NotAFileMessageTests(unittest.TestCase):
             rc = sq.run_caption(args)
         self.assertEqual(rc, sq.EXIT_ERROR)
         self.assertIn("not a file", err.getvalue())
+
+
+def make_ppm16(width: int, height: int, pixel_fn) -> bytes:
+    """Build a P6 PPM with maxval 65535 (2 bytes/channel, big-endian);
+    pixel_fn(x, y) -> (r, g, b) in 0..65535."""
+    raster = bytearray()
+    for y in range(height):
+        for x in range(width):
+            for channel in pixel_fn(x, y):
+                raster.extend(channel.to_bytes(2, "big"))
+    return b"P6\n%d %d\n65535\n" % (width, height) + bytes(raster)
+
+
+class Ppm16BitTests(unittest.TestCase):
+    """QA-loop round: a 10-bit clip (yuv420p10le, common for HDR /
+    phone footage) crashed `check` with an uncaught ValueError —
+    ffmpeg's ppm encoder writes maxval 65535 for 10/16-bit input,
+    and parse_ppm_bytes only accepted 255."""
+
+    def test_parse_16bit_downconverts_to_8bit(self):
+        data = make_ppm16(2, 1, lambda x, y:
+                          (65535, 65535, 65535) if x == 0
+                          else (0x8000, 0x8000, 0x8000))
+        w, h, rgb = sq.parse_ppm_bytes(data)
+        self.assertEqual((w, h), (2, 1))
+        # High byte of each 16-bit sample is its 8-bit value.
+        self.assertEqual(rgb, bytes([255, 255, 255, 128, 128, 128]))
+
+    def test_16bit_white_edge_ratio(self):
+        width = 100
+        data = make_ppm16(width, 100, lambda x, y:
+                          (65535, 65535, 65535) if x >= width - 15
+                          else (0, 0, 0))
+        w, h, rgb = sq.parse_ppm_bytes(data)
+        ratios = sq.white_edge_ratios(w, h, rgb)
+        self.assertEqual(ratios["right"], 1.0)
+        self.assertEqual(ratios["left"], 0.0)
+
+    def test_16bit_truncated_raster_rejected(self):
+        # 2x2 at 16-bit needs 24 raster bytes; 20 is short.
+        with self.assertRaises(ValueError):
+            sq.parse_ppm_bytes(b"P6\n2 2\n65535\n" + b"\x00" * 20)
+
+    def test_other_maxval_still_rejected(self):
+        with self.assertRaises(ValueError):
+            sq.parse_ppm_bytes(b"P6\n2 2\n100\n" + bytes(12))
+
+    def test_non_positive_dimensions_rejected(self):
+        # Fuzz finding: "P6\\n-5 10\\n255\\n" used to parse "fine"
+        # with an empty raster, and white_edge_ratios then crashed
+        # with IndexError on the negative offsets.
+        for header in (b"P6\n0 10\n255\n", b"P6\n10 0\n255\n",
+                       b"P6\n0 0\n255\n", b"P6\n-5 10\n255\n",
+                       b"P6\n10 -5\n255\n"):
+            with self.assertRaises(ValueError, msg=header):
+                sq.parse_ppm_bytes(header)
+
+
+class WhiteEdgeUnparseableTests(unittest.TestCase):
+    """QA-loop round: unlike the freeze/black gate (which skips a
+    frame it cannot parse), the white-edge gate let a ValueError from
+    parse_ppm_bytes propagate and kill the whole `check` run with a
+    traceback. Unparseable frames must be skipped; only when none
+    parses does the gate report an error."""
+
+    def test_unparseable_frames_are_skipped_not_a_crash(self):
+        def fake_run(cmd):
+            out = Path(cmd[-1])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"P6\n10 10\n255\n" + bytes(10))  # truncated
+            return mock.Mock(returncode=0, stderr="")
+
+        with mock.patch.object(sq, "_run", side_effect=fake_run), \
+                mock.patch.object(sq, "_require_binary",
+                                  return_value="ffmpeg"):
+            result = sq.gate_white_edge(Path("clip.mp4"), 9.0)
+        self.assertEqual(result.status, "error")
+        self.assertIn("could not extract", result.summary)
+
+
+class DeadAirVnTests(unittest.TestCase):
+    """QA-loop round: the dead-air gate ran ffmpeg WITHOUT -vn, so
+    checking a 60 s 1080x1920 clip decoded the entire video stream
+    just to throw it away (~17 s of the ~30 s check). silencedetect
+    only needs the audio track."""
+
+    def test_dead_air_decodes_audio_only(self):
+        stderr = ("frame= 10 fps=5 time=00:00:02.00 bitrate=1x\n"
+                  "[silencedetect @ 0x55] silence_start: 4.000\n"
+                  "[silencedetect @ 0x55] silence_end: 7.500 | "
+                  "silence_duration: 3.5\n"
+                  "frame= 20 fps=5 time=00:00:09.00 bitrate=1x\n")
+        seen = {}
+
+        def fake_run(cmd):
+            seen["cmd"] = list(cmd)
+            return mock.Mock(returncode=0, stderr=stderr)
+
+        with mock.patch.object(sq, "_run", side_effect=fake_run), \
+                mock.patch.object(sq, "_require_binary",
+                                  return_value="ffmpeg"):
+            result = sq.gate_dead_air(Path("clip.mp4"), 9.0, 2.5,
+                                      has_audio=True)
+        self.assertIn("-vn", seen["cmd"])
+        self.assertEqual(result.status, "fail")
+        self.assertIn("3.5s", result.summary)
+
+
+class NonFiniteThresholdTests(unittest.TestCase):
+    """QA-loop round: non-finite thresholds were accepted and then
+    silently disabled their gate — every comparison against nan/inf
+    is False, so `--max-gap nan` passed any silence and
+    `--min-lufs=-inf --max-lufs=inf` passed a -inf LUFS (silent)
+    file. The same family as the vacuous `--lang` pass fixed in
+    v0.2.3: a check that cannot fail is not a check."""
+
+    def test_non_finite_duration_threshold_is_usage_error(self):
+        for bad in ("nan", "inf", "-inf", "NaN", "Infinity"):
+            with self.assertRaises(SystemExit) as ctx:
+                sq.build_parser().parse_args(
+                    ["check", "x.mp4", "--max-gap", bad])
+            self.assertEqual(ctx.exception.code, 2, bad)
+        with self.assertRaises(SystemExit) as ctx:
+            sq.build_parser().parse_args(
+                ["check", "x.mp4", "--max-freeze", "nan"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_non_finite_loudness_range_is_usage_error(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as fh:
+            for args in (["--min-lufs=-inf", "--max-lufs=-10"],
+                         ["--min-lufs=-24", "--max-lufs=inf"],
+                         ["--min-lufs=nan", "--max-lufs=-10"]):
+                rc = sq.main(["check", fh.name, *args])
+                self.assertEqual(rc, sq.EXIT_ERROR, args)
+
+    def test_non_finite_fontsize_is_clean_error(self):
+        with self.assertRaises(ValueError):
+            sq.caption_capacity(720, float("inf"))
+        with self.assertRaises(ValueError):
+            sq.caption_capacity(720, float("nan"))
+
+    def test_caption_fontsize_inf_exits_2_not_traceback(self):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = sq.main(["caption", "--width", "720",
+                          "--fontsize", "inf", "hello"])
+        self.assertEqual(rc, sq.EXIT_ERROR)
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertIn("finite", err.getvalue())

@@ -3,6 +3,46 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.4] - 2026-11-08
+
+### Fixed
+
+- **A 10-bit clip no longer crashes `check` with a traceback.**
+  For 10/16-bit input (e.g. `yuv420p10le`, common for HDR and phone
+  footage) ffmpeg's ppm encoder writes maxval 65535, which the PPM
+  parser rejected — and the white-edge gate, unlike the freeze/black
+  gate, let that `ValueError` propagate and kill the whole run before
+  any report was printed. The parser now accepts maxval 65535
+  (16-bit samples, high byte = 8-bit value) and the white-edge gate
+  skips a frame it cannot parse instead of crashing, so a 10-bit
+  clip now gets a full report (both frame gates analyse its frames).
+- **The PPM parser no longer accepts non-positive dimensions.**
+  A fuzzed header such as `P6, -5x10` used to parse "fine" with an
+  empty raster, and the edge-ratio math then crashed with an
+  `IndexError` on the negative offsets. Non-positive width/height
+  is now a clean `ValueError`.
+- **Non-finite thresholds no longer silently disable their gate.**
+  `--max-gap nan` / `inf` (and the same for `--max-black` /
+  `--max-freeze`) was accepted, and every comparison against
+  `nan`/`inf` is False — so any silence gap passed. Likewise
+  `--min-lufs=-inf --max-lufs=inf` passed a -inf LUFS (silent)
+  file. Duration thresholds now reject non-finite values at parse
+  time (exit 2) and the loudness range is validated the same way;
+  `--fontsize inf`/`nan` is a clean usage error instead of a
+  leaked "cannot convert float NaN to integer" message.
+- **The dead-air gate no longer decodes the whole video.**
+  Its ffmpeg call was missing `-vn`, so checking a 60 s 1080x1920
+  clip decoded all 1800 video frames just to throw them away —
+  17 s of the check. The gate now decodes audio only (~1.7 s for
+  the same clip); the silencedetect output is unchanged.
+- 11 regression tests — 56 tests total.
+
+### Performance
+
+- `check` on a 60 s 1080x1920 clip: dead-air 17.1 s → 1.7 s
+  (audio-only decode); total user CPU 34 s → ~21 s. The remaining
+  time is ffmpeg's own loudnorm analysis and frame sampling.
+
 ## [0.2.3] - 2026-10-27
 
 ### Fixed

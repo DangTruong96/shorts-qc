@@ -356,7 +356,7 @@ def gate_dead_air(video: Path, total_duration: float, max_gap: float,
     ffmpeg = _require_binary("ffmpeg")
     proc = _run([
         ffmpeg, "-hide_banner", "-i", str(video),
-        "-af", f"silencedetect=noise={DEFAULT_SILENCE_NOISE}:d={DEFAULT_SILENCE_MIN_DURATION}",
+        "-vn", "-af", f"silencedetect=noise={DEFAULT_SILENCE_NOISE}:d={DEFAULT_SILENCE_MIN_DURATION}",
         "-f", "null", "-",
     ])
     # The container's duration can lie (bad metadata); ffmpeg's own
@@ -400,7 +400,15 @@ def gate_dead_air(video: Path, total_duration: float, max_gap: float,
 # --------------------------------------------------------------------------
 
 def parse_ppm_bytes(data: bytes) -> tuple[int, int, bytes]:
-    """Parse a binary PPM (P6, maxval 255) image. Returns (width, height, rgb)."""
+    """Parse a binary PPM (P6) image. Returns (width, height, rgb).
+
+    Accepts the two maxvals ffmpeg's ppm encoder emits: 255 (8-bit
+    input) and 65535 (10/16-bit input, 2 bytes per channel,
+    big-endian — the high byte of each sample is the 8-bit value).
+    Any other maxval, a non-positive dimension, or a short raster is
+    a ValueError: callers treat unparseable frames as an error, never
+    a crash (a 10-bit clip used to kill the whole `check` run here).
+    """
     tokens: list[bytes] = []
     idx = 0
     # Header: 4 whitespace-separated tokens; '#' starts a comment to EOL.
@@ -420,11 +428,21 @@ def parse_ppm_bytes(data: bytes) -> tuple[int, int, bytes]:
     if tokens[0] != b"P6":
         raise ValueError("not a P6 PPM image")
     width, height, maxval = int(tokens[1]), int(tokens[2]), int(tokens[3])
-    if maxval != 255:
-        raise ValueError(f"unsupported PPM maxval {maxval} (expected 255)")
-    raster = data[idx: idx + width * height * 3]
-    if len(raster) < width * height * 3:
+    if width <= 0 or height <= 0:
+        raise ValueError(f"invalid PPM dimensions {width}x{height}")
+    if maxval == 255:
+        bytes_per_sample = 1
+    elif maxval == 65535:
+        bytes_per_sample = 2
+    else:
+        raise ValueError(f"unsupported PPM maxval {maxval} (expected 255 or 65535)")
+    raster = data[idx: idx + width * height * 3 * bytes_per_sample]
+    if len(raster) < width * height * 3 * bytes_per_sample:
         raise ValueError("truncated PPM raster")
+    if bytes_per_sample == 2:
+        # 16-bit samples are big-endian: the high byte of each sample
+        # is its 8-bit value (bytes slicing with a step is C-speed).
+        raster = raster[0::2]
     return width, height, raster
 
 
@@ -463,7 +481,14 @@ def gate_white_edge(video: Path, total_duration: float) -> GateResult:
 
         def absorb(path: Path) -> None:
             nonlocal frames_checked
-            width, height, rgb = parse_ppm_bytes(path.read_bytes())
+            try:
+                width, height, rgb = parse_ppm_bytes(path.read_bytes())
+            except ValueError:
+                # A frame ffmpeg wrote but the parser cannot read
+                # (truncated write, unexpected encoding) is skipped
+                # like in the freeze/black gate — it must never kill
+                # the whole run with a traceback.
+                return
             ratios = white_edge_ratios(width, height, rgb)
             for edge, ratio in ratios.items():
                 worst[edge] = max(worst[edge], ratio)
@@ -675,10 +700,10 @@ def caption_capacity(width_px: int, fontsize: float) -> int:
     floor((width - fontsize) / fontsize) = 11 for that case, and scales
     the same way at other sizes.
     """
-    if fontsize <= 0:
-        raise ValueError("fontsize must be positive")
-    if width_px <= 0:
-        raise ValueError("width must be positive")
+    if fontsize <= 0 or not math.isfinite(fontsize):
+        raise ValueError("fontsize must be a finite positive number")
+    if width_px <= 0 or not math.isfinite(width_px):
+        raise ValueError("width must be a finite positive number")
     return max(0, math.floor((width_px - fontsize) / fontsize))
 
 
@@ -848,6 +873,11 @@ def run_check(args: argparse.Namespace) -> int:
         else:
             print(f"error: video not found: {video}", file=sys.stderr)
         return EXIT_ERROR
+    if not (math.isfinite(args.min_lufs) and math.isfinite(args.max_lufs)):
+        print("error: --min-lufs and --max-lufs must be finite numbers "
+              "(an infinite bound silently disables the loudness gate)",
+              file=sys.stderr)
+        return EXIT_ERROR
     if args.min_lufs > args.max_lufs:
         print(f"error: --min-lufs ({args.min_lufs}) must not exceed "
               f"--max-lufs ({args.max_lufs})", file=sys.stderr)
@@ -900,11 +930,18 @@ def run_check(args: argparse.Namespace) -> int:
 def _non_negative_float(text: str) -> float:
     """argparse type for duration thresholds: negative values are a
     usage error (exit 2), not a verdict — a negative limit makes even
-    a zero-length run "exceed" it and produced nonsense FAILs."""
+    a zero-length run "exceed" it and produced nonsense FAILs. The
+    same holds for non-finite values: `nan`/`inf` compare False
+    against every measured gap, so a `--max-gap nan` silently
+    disabled the dead-air gate (a vacuous pass) instead of erroring.
+    """
     try:
         value = float(text)
     except ValueError:
         raise argparse.ArgumentTypeError(f"invalid number: {text!r}")
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(
+            f"value must be a finite number: {text!r}")
     if value < 0:
         raise argparse.ArgumentTypeError(
             f"value must not be negative: {text!r}")
