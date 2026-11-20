@@ -51,10 +51,12 @@ is "public" would have been false; this document no longer makes it.
   claims otherwise. The maintainer uses the gates in a daily
   production pipeline; community adoption is a thing that has to
   happen after publication, not a thing to assert before it.
-- **The language gate is not covered by automated tests**, because it
-  depends on the optional `faster-whisper` package and a downloaded
-  speech model. Its skip behavior is exercised in every captured run
-  in `examples/`; its detection behavior is not unit-tested.
+- **The language gate is not covered by live-model tests**, because
+  it depends on the optional `faster-whisper` package and a
+  downloaded speech model. Its skip behaviour for non-`ja` targets
+  and its pass/fail behaviour for `ja` are unit-tested with a
+  stubbed module (since v0.2.3); what the tiny model actually hears
+  on real audio is not unit-tested.
 - **Loudness and dead-air are whole-file measurements** in v0.1.0;
   per-scene reporting is roadmap work (v0.2), stated as such in the
   README and `docs/USAGE.md`.

@@ -287,7 +287,8 @@ has 3 s of silence and a white right column built in; exit code `1`.)
         "fps": 30.0,
         "orientation": "portrait",
         "aspect": 0.5625,
-        "has_audio": true
+        "has_audio": true,
+        "rotation": 0
       }
     },
     {
@@ -380,7 +381,9 @@ How to read it:
   on; `aspect` is `width / height` (0.5625 = 9:16). `has_audio` says
   whether the file carries an audio stream at all; when it is `false`
   the loudness and dead-air gates report errors instead of measuring
-  nothing.
+  nothing. `rotation` is the display rotation in degrees (0 when
+  unrotated); for 90/270-degree clips `width`/`height` are already
+  the swapped display dimensions.
 - **`loudness.details.input_i_lufs`** — integrated loudness as
   measured by loudnorm (−21.92), with the enforced window next to it.
 - **`dead-air.details.offending_gaps`** — only the gaps that failed,

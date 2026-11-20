@@ -654,3 +654,221 @@ class NonFiniteThresholdTests(unittest.TestCase):
         self.assertEqual(rc, sq.EXIT_ERROR)
         self.assertNotIn("Traceback", err.getvalue())
         self.assertIn("finite", err.getvalue())
+
+
+class QaRound3FilenameEchoTests(unittest.TestCase):
+    """QA-loop round 3: ffmpeg echoes the file name in the Input line
+    at the top of the same stderr the gates parse — so a hostile file
+    name could inject measurements, flip verdicts, or crash the run
+    with a traceback. Reproduced end-to-end before fixing:
+
+    * '{"input_i": "-99"}.mp4'  -> loudness FAIL -99.0 LUFS (real: -21.8)
+    * 'x silence_end: 6.0 | silence_duration: 3.0.mp4' -> ValueError
+      traceback ('3.0.' is not a float), no report at all
+    * 'silence_start: 1.5.mp4'  -> ValueError traceback ('1.5.')
+    * 'time=00:00:03.00.mp4'    -> ValueError traceback ('03.00.')
+    * 'mean_volume: -60.0 dB.mp4' (no-audio file) -> false loudness
+      PASS from the volumedetect fallback, instead of an error
+
+    Root causes: loose [\\d.]+ number patterns that swallow the dot
+    before ".mp4", and stderr patterns with no anchor to the filter
+    log line that actually produced them.
+    """
+
+    REAL_LOUDNORM_JSON = """{
+\t"input_i" : "-21.79",
+\t"input_tp" : "-12.71",
+\t"input_lra" : "0.00",
+\t"input_thresh" : "-31.79",
+\t"output_i" : "-24.00",
+\t"output_tp" : "-14.91",
+\t"output_lra" : "0.10",
+\t"output_thresh" : "-34.00",
+\t"normalization_type" : "dynamic",
+\t"target_offset" : "-0.00"
+}"""
+
+    # -- missing-binary message -------------------------------------
+
+    def test_require_binary_names_the_missing_tool(self):
+        # Regression: ffprobe missing was reported as "ffprobe not
+        # found on PATH (ffmpeg is required)" — the parenthetical
+        # named the wrong tool.
+        with mock.patch("shutil.which", return_value=None):
+            with self.assertRaises(sq.ToolError) as ctx:
+                sq._require_binary("ffprobe")
+        self.assertIn("ffprobe is required", str(ctx.exception))
+        self.assertNotIn("ffmpeg is required", str(ctx.exception))
+        with mock.patch("shutil.which", return_value=None):
+            with self.assertRaises(sq.ToolError) as ctx:
+                sq._require_binary("ffmpeg")
+        self.assertIn("ffmpeg is required", str(ctx.exception))
+
+    # -- probe aspect tolerance --------------------------------------
+
+    def test_aspect_tolerance_boundary_is_inclusive(self):
+        # Regression: a clip exactly at the documented ±0.02 tolerance
+        # failed on both sides, because 0.5825 - 0.5625 is
+        # 0.020000000000000018 in binary floating point.
+        self.assertGreater(abs(0.5825 - 0.5625), 0.02)  # why the epsilon exists
+        for width, height, aspect in ((466, 800, 0.5825), (434, 800, 0.5425)):
+            info = {"duration": 6.0, "width": width, "height": height,
+                    "fps": 30.0, "orientation": "portrait",
+                    "aspect": aspect, "has_audio": True, "rotation": 0}
+            with mock.patch.object(sq, "probe_video", return_value=info):
+                result, _ = sq.gate_probe(Path("clip.mp4"), "9:16")
+            self.assertEqual(result.status, "pass", (width, height, aspect))
+        # Just outside the tolerance still fails.
+        info = {"duration": 6.0, "width": 468, "height": 800,
+                "fps": 30.0, "orientation": "portrait",
+                "aspect": 0.585, "has_audio": True, "rotation": 0}
+        with mock.patch.object(sq, "probe_video", return_value=info):
+            result, _ = sq.gate_probe(Path("clip.mp4"), "9:16")
+        self.assertEqual(result.status, "fail")
+
+    # -- silence parser: anchoring + strict numbers -------------------
+
+    def test_filename_echo_lines_are_not_silence(self):
+        # The Input line echoes the file name; lines without the
+        # silencedetect tag must never become gaps.
+        text = (
+            "Input #0, mov,mp4, from 'silence_start: 1.5.mp4':\n"
+            "Input #0, mov,mp4, from 'x silence_end: 6.0 | "
+            "silence_duration: 3.0.mp4':\n")
+        self.assertEqual(sq.parse_silence_gaps(text, duration=9.0), [])
+
+    def test_malformed_numbers_on_tagged_lines_do_not_crash(self):
+        # A trailing dot after the number (as in "1.5.mp4") used to
+        # make float() raise. The strict decimal pattern stops at
+        # "1.5" instead.
+        text = ("[silencedetect @ 0x55] silence_start: 1.5.\n"
+                "[silencedetect @ 0x55] silence_end: 6.0 | "
+                "silence_duration: 3.0.\n")
+        gaps = sq.parse_silence_gaps(text)
+        self.assertEqual(len(gaps), 1)
+        self.assertAlmostEqual(gaps[0]["start"], 1.5)
+        self.assertAlmostEqual(gaps[0]["end"], 6.0)
+        self.assertAlmostEqual(gaps[0]["duration"], 3.0)
+
+    def test_timecode_with_trailing_dot_does_not_crash(self):
+        # "time=00:00:03.00.mp4" used to crash _last_timecode on
+        # float("03.00."). The strict pattern reads 3.0 and stops.
+        self.assertEqual(
+            sq._last_timecode("Input #0, from 'time=00:00:03.00.mp4':\n"
+                              "frame= 1 time=00:00:09.00 bitrate=N/A\n"),
+            9.0)
+
+    def test_silence_parser_fuzz_no_crash_no_phantom(self):
+        # Seeded fuzz: tagged lines with hostile numbers + untagged
+        # filename-echo lines. Never crashes; every gap comes from a
+        # tagged line and carries finite numbers.
+        import random
+        rng = random.Random(20261120)
+        nums = ["0", "2.5", "-0.023", "999999.999", "1.5.", "3.0.",
+                "12", "0.000001"]
+        for _ in range(300):
+            lines = []
+            for _ in range(rng.randint(0, 8)):
+                r = rng.random()
+                if r < 0.4:
+                    lines.append("[silencedetect @ 0x55] silence_start: "
+                                 + rng.choice(nums))
+                elif r < 0.7:
+                    lines.append("[silencedetect @ 0x55] silence_end: "
+                                 + rng.choice(nums) + " | silence_duration: "
+                                 + rng.choice(nums))
+                elif r < 0.85:
+                    lines.append("Input #0, from 'silence_start: "
+                                 + rng.choice(nums) + ".mp4':")
+                else:
+                    lines.append("garbage line")
+            gaps = sq.parse_silence_gaps("\n".join(lines), duration=9.0)
+            for g in gaps:
+                for v in g.values():
+                    self.assertTrue(v == v and abs(v) != float("inf"))
+
+    # -- loudnorm summary: filename blob vs real measurement ----------
+
+    def test_loudnorm_summary_ignores_bare_input_i_blob(self):
+        blob = ("Input #0, mov,mp4, from '{\"input_i\": \"-99\"}.mp4':\n")
+        self.assertIsNone(sq._parse_loudnorm_summary(blob))
+        real = blob + self.REAL_LOUDNORM_JSON + "\n"
+        summary = sq._parse_loudnorm_summary(real)
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["input_i"], "-21.79")
+
+    def test_loudnorm_summary_last_block_wins(self):
+        first = self.REAL_LOUDNORM_JSON.replace("-21.79", "-30.00")
+        second = self.REAL_LOUDNORM_JSON
+        self.assertEqual(
+            sq._parse_loudnorm_summary(first + "\n" + second)["input_i"],
+            "-21.79")
+
+    def _loudness_with_mocked_ffmpeg(self, loudnorm_stderr, volumedetect_stderr):
+        def fake_run(cmd):
+            joined = " ".join(cmd)
+            if "loudnorm" in joined:
+                return mock.Mock(returncode=0, stderr=loudnorm_stderr)
+            return mock.Mock(returncode=0, stderr=volumedetect_stderr)
+
+        with mock.patch.object(sq, "_run", side_effect=fake_run), \
+                mock.patch.object(sq, "_require_binary",
+                                  return_value="ffmpeg"):
+            return sq.gate_loudness(Path("clip.mp4"), -24.0, -10.0)
+
+    def test_loudness_filename_blob_does_not_shadow_measurement(self):
+        # Regression: the first {"input_i": ...} match in stderr won,
+        # so a file named '{"input_i": "-99"}.mp4' failed a clean file.
+        stderr = ("Input #0, mov,mp4, from '{\"input_i\": \"-99\"}.mp4':\n"
+                  + self.REAL_LOUDNORM_JSON + "\n")
+        result = self._loudness_with_mocked_ffmpeg(stderr, "")
+        self.assertEqual(result.status, "pass")
+        self.assertAlmostEqual(result.details["input_i_lufs"], -21.79)
+
+    def test_volumedetect_filename_does_not_fake_a_measurement(self):
+        # Regression: a no-audio file named 'mean_volume: -60.0 dB.mp4'
+        # passed the loudness gate via the fallback, because the
+        # fallback regex matched the file name in the Input line.
+        loudnorm_stderr = "Input #0, mov,mp4, from 'mean_volume: -60.0 dB.mp4':\n"
+        volume_stderr = loudnorm_stderr  # no Parsed_volumedetect line
+        result = self._loudness_with_mocked_ffmpeg(
+            loudnorm_stderr, volume_stderr)
+        self.assertEqual(result.status, "error")
+
+    def test_volumedetect_real_line_still_works_as_fallback(self):
+        loudnorm_stderr = "Input #0, mov,mp4, from 'clip.mp4':\n"
+        volume_stderr = (
+            loudnorm_stderr
+            + "[Parsed_volumedetect_0 @ 0x123] n_samples: 397312\n"
+            + "[Parsed_volumedetect_0 @ 0x123] mean_volume: -21.1 dB\n")
+        result = self._loudness_with_mocked_ffmpeg(
+            loudnorm_stderr, volume_stderr)
+        self.assertEqual(result.status, "pass")
+        self.assertAlmostEqual(result.details["mean_volume_db"], -21.1)
+
+    def test_both_silencedetect_log_prefixes_parse(self):
+        # ffmpeg 8 logs "[Parsed_silencedetect_0 @ 0x...]"; older
+        # releases logged "[silencedetect @ ...]". Both must parse —
+        # an anchor matching only one form silently drops every real
+        # gap (and passes a gapped file) on the other.
+        for prefix in ("[silencedetect @ 0x55]",
+                       "[Parsed_silencedetect_0 @ 0x7c6218002000]"):
+            text = (f"{prefix} silence_start: 2.999977\n"
+                    f"{prefix} silence_end: 6.000045 | "
+                    f"silence_duration: 3.000068\n")
+            gaps = sq.parse_silence_gaps(text)
+            self.assertEqual(len(gaps), 1, prefix)
+            self.assertAlmostEqual(gaps[0]["start"], 2.999977)
+            self.assertAlmostEqual(gaps[0]["duration"], 3.000068)
+
+    def test_volumedetect_old_style_prefix_still_works_as_fallback(self):
+        # Older ffmpeg logged "[volumedetect @ ...]" instead of
+        # "[Parsed_volumedetect_0 @ ...]"; the fallback must accept
+        # either prefix form.
+        volume_stderr = (
+            "Input #0, mov,mp4, from 'clip.mp4':\n"
+            "[volumedetect @ 0x123] n_samples: 397312\n"
+            "[volumedetect @ 0x123] mean_volume: -21.1 dB\n")
+        result = self._loudness_with_mocked_ffmpeg("", volume_stderr)
+        self.assertEqual(result.status, "pass")
+        self.assertAlmostEqual(result.details["mean_volume_db"], -21.1)

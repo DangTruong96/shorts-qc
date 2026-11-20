@@ -70,7 +70,7 @@ class ToolError(Exception):
 def _require_binary(name: str) -> str:
     path = shutil.which(name)
     if path is None:
-        raise ToolError(f"{name} not found on PATH (ffmpeg is required)")
+        raise ToolError(f"{name} not found on PATH ({name} is required)")
     return path
 
 
@@ -226,7 +226,11 @@ def gate_probe(video: Path, expect: str | None) -> tuple[GateResult, dict]:
     if expect:
         exp_w, exp_h = (float(p) for p in expect.split(":"))
         expected_ratio = exp_w / exp_h
-        if abs(info["aspect"] - expected_ratio) > 0.02:
+        # Binary floating point makes a ratio exactly at the documented
+        # ±0.02 tolerance compute a hair over it (0.5825 - 0.5625 is
+        # 0.020000000000000018), so a 466x800 clip — exactly at the
+        # tolerance — failed. The epsilon makes the boundary inclusive.
+        if abs(info["aspect"] - expected_ratio) > 0.02 + 1e-9:
             status = "fail"
             summary += f" — expected aspect {expect} ({expected_ratio:.3f}), got {info['aspect']}"
         else:
@@ -239,6 +243,59 @@ def gate_probe(video: Path, expect: str | None) -> tuple[GateResult, dict]:
 # --------------------------------------------------------------------------
 
 _LOUDNORM_JSON_RE = re.compile(r"\{\s*\"input_i\".*?\}", re.DOTALL)
+# Keys a real loudnorm summary always carries (ffmpeg's
+# print_format=json output). A bare {"input_i": ...} block is not
+# enough: the file name is echoed in the Input line at the top of the
+# same stderr, so a name containing {"input_i": "-99"} used to be
+# mistaken for the measurement and fail a clean file.
+_LOUDNORM_SUMMARY_KEYS = (
+    "input_i", "input_tp", "input_lra",
+    "output_i", "output_tp", "output_lra", "target_offset",
+)
+# volumedetect's own log line: "[Parsed_volumedetect_0 @ 0x...]
+# mean_volume: -21.1 dB" on ffmpeg 8, "[volumedetect @ ...]" on older
+# releases. The filter name in the line is the anchor — a file name
+# containing "mean_volume: -60.0 dB" used to be read as the fallback
+# measurement and pass a file with no audio at all.
+_VOLUMEDETECT_MEAN_RE = re.compile(
+    r"mean_volume:\s*(-?\d+(?:\.\d+)?) dB")
+
+
+def _parse_volumedetect_mean(stderr_text: str) -> float | None:
+    """mean_volume from ffmpeg volumedetect stderr, or None.
+
+    Only lines the volumedetect filter itself logged count; the file
+    name echoed in the Input line at the top of the same stderr can
+    contain a "mean_volume: ... dB" string.
+    """
+    for line in stderr_text.splitlines():
+        if "volumedetect" not in line:
+            continue
+        match = _VOLUMEDETECT_MEAN_RE.search(line)
+        if match:
+            return float(match.group(1))
+    return None
+
+
+def _parse_loudnorm_summary(stderr_text: str) -> dict | None:
+    """The loudnorm summary dict from ffmpeg stderr, or None.
+
+    The real summary is printed once, at the end of the run — but a
+    file name (or metadata) echoed earlier in the same stderr can
+    contain a JSON-looking {"input_i": ...} blob. Only a block
+    carrying the loudnorm summary keys counts, and the last such
+    block wins.
+    """
+    found = None
+    for match in _LOUDNORM_JSON_RE.finditer(stderr_text):
+        try:
+            candidate = json.loads(match.group(0))
+        except ValueError:
+            continue
+        if isinstance(candidate, dict) and all(
+                k in candidate for k in _LOUDNORM_SUMMARY_KEYS):
+            found = candidate
+    return found
 
 
 def gate_loudness(video: Path, min_lufs: float, max_lufs: float) -> GateResult:
@@ -248,12 +305,11 @@ def gate_loudness(video: Path, min_lufs: float, max_lufs: float) -> GateResult:
         ffmpeg, "-hide_banner", "-i", str(video),
         "-vn", "-af", "loudnorm=print_format=json", "-f", "null", "-",
     ])
-    match = _LOUDNORM_JSON_RE.search(proc.stderr)
-    if match:
+    measured = _parse_loudnorm_summary(proc.stderr)
+    if measured is not None:
         try:
-            measured = json.loads(match.group(0))
             lufs = float(measured["input_i"])
-        except (ValueError, KeyError):
+        except (ValueError, KeyError, TypeError):
             lufs = None
         if lufs is not None:
             if lufs < min_lufs:
@@ -274,12 +330,12 @@ def gate_loudness(video: Path, min_lufs: float, max_lufs: float) -> GateResult:
         ffmpeg, "-hide_banner", "-i", str(video),
         "-vn", "-af", "volumedetect", "-f", "null", "-",
     ])
-    mean = re.search(r"mean_volume:\s*(-?[\d.]+) dB", proc.stderr)
-    if mean:
+    mean = _parse_volumedetect_mean(proc.stderr)
+    if mean is not None:
         return GateResult("loudness", "pass",
-                            f"loudnorm unavailable; volumedetect mean_volume {mean.group(1)} dB "
+                            f"loudnorm unavailable; volumedetect mean_volume {mean} dB "
                             f"(fallback, not LUFS — gate not enforced)",
-                            {"mean_volume_db": float(mean.group(1)), "fallback": "volumedetect"})
+                            {"mean_volume_db": mean, "fallback": "volumedetect"})
     return GateResult("loudness", "error",
                         "could not measure loudness (no audio stream?)",
                         {"stderr_tail": proc.stderr.strip()[-200:]})
@@ -289,9 +345,14 @@ def gate_loudness(video: Path, min_lufs: float, max_lufs: float) -> GateResult:
 # c. Dead-air gate
 # --------------------------------------------------------------------------
 
-_SILENCE_START_RE = re.compile(r"silence_start:\s*(-?[\d.]+)")
-_SILENCE_END_RE = re.compile(r"silence_end:\s*(-?[\d.]+)\s*\|\s*silence_duration:\s*(-?[\d.]+)")
-_TIMECODE_RE = re.compile(r"time=(\d+):(\d+):([\d.]+)")
+# Numbers are strict decimals: the loose [\d.]+ used to swallow the dot
+# before a file extension ("silence_start: 1.5.mp4" matched "1.5."), and
+# float() then crashed the whole run with a traceback. A strict pattern
+# matches "1.5" and stops, so no match can ever fail float().
+_SILENCE_START_RE = re.compile(r"silence_start:\s*(-?\d+(?:\.\d+)?)")
+_SILENCE_END_RE = re.compile(
+    r"silence_end:\s*(-?\d+(?:\.\d+)?)\s*\|\s*silence_duration:\s*(-?\d+(?:\.\d+)?)")
+_TIMECODE_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 
 
 def _last_timecode(stderr_text: str) -> float | None:
@@ -315,10 +376,20 @@ def parse_silence_gaps(stderr_text: str, duration: float | None = None) -> list[
     Returns [{"start": float, "end": float, "duration": float}, ...].
     A trailing silence with no silence_end line is closed at `duration`
     when a duration is known.
+
+    Only lines from the silencedetect filter itself (carrying the
+    filter's name in their log prefix — "[silencedetect @ ...]" on
+    older ffmpeg, "[Parsed_silencedetect_0 @ ...]" on ffmpeg 8) are
+    read. ffmpeg echoes the file name in the Input line at the top
+    of the same stderr, so a name containing e.g. "silence_end: 6.0
+    | silence_duration: 3.0" used to inject a phantom gap — or crash
+    the run — for a file with no silence at all.
     """
     gaps: list[dict] = []
     pending_start: float | None = None
     for line in stderr_text.splitlines():
+        if "silencedetect" not in line:
+            continue
         start_match = _SILENCE_START_RE.search(line)
         if start_match:
             pending_start = float(start_match.group(1))

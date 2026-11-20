@@ -3,6 +3,56 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.5] - 2026-11-20
+
+### Fixed
+
+- **A file name can no longer inject measurements, flip verdicts,
+  or crash `check`.** ffmpeg echoes the file name in the `Input`
+  line at the top of the same stderr the gates parse, and the
+  parsers trusted every line of it:
+  - A file named `{"input_i": "-99"}.mp4` failed the loudness gate
+    at −99.0 LUFS (real measurement: −21.8) — the loudness parser
+    took the first `{"input_i": ...}` match in stderr, which was
+    the file name, not the loudnorm summary. It now only accepts a
+    block carrying the loudnorm summary keys, and the last such
+    block wins.
+  - A file named `x silence_end: 6.0 | silence_duration: 3.0.mp4`
+    (or `silence_start: 1.5.mp4`, or `time=00:00:03.00.mp4`)
+    crashed the whole run with an uncaught `ValueError` traceback
+    (`float("3.0.")`), printing no report at all — the loose
+    `[\d.]+` number patterns swallowed the dot before `.mp4`.
+    Number patterns are now strict decimals, so no match can ever
+    fail `float()`.
+  - A no-audio file named `mean_volume: -60.0 dB.mp4` passed the
+    loudness gate via the volumedetect fallback, instead of
+    erroring honestly — the fallback regex matched the file name.
+    The silence parser now only reads lines the silencedetect
+    filter itself logged, and the volumedetect fallback only reads
+    `mean_volume` from a line the volumedetect filter itself
+    logged, so a file name can no longer masquerade as a filter
+    measurement. (The anchors accept both log-prefix forms —
+    `[silencedetect @ ...]` and ffmpeg 8's
+    `[Parsed_silencedetect_0 @ ...]` — after a first version of
+    the fix that only matched the old form silently dropped every
+    real silence gap.)
+- **A clip exactly at the ±0.02 aspect tolerance no longer fails
+  the probe gate.** `0.5825 - 0.5625` is `0.020000000000000018`
+  in binary floating point, so a 466x800 clip (and a 434x800 one
+  on the other side) failed `--expect 9:16` despite being exactly
+  at the documented tolerance. The comparison now allows a small
+  epsilon, making the boundary inclusive as documented.
+- **A missing `ffprobe` is no longer reported as an `ffmpeg`
+  problem.** `_require_binary` always said "(ffmpeg is required)"
+  even when the missing binary was `ffprobe`; the message now
+  names the binary that is actually missing.
+- **Documentation:** `docs/USAGE.md`'s annotated JSON report was
+  missing the `rotation` field the probe gate has reported since
+  v0.2.2; `EVALUATION.md` still claimed the language gate "is not
+  covered by automated tests", which has been untrue since the
+  stubbed-module tests landed in v0.2.3. Both corrected.
+- 13 regression tests — 69 tests total.
+
 ## [0.2.4] - 2026-11-08
 
 ### Fixed
